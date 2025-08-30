@@ -1,5 +1,5 @@
 // mbuild.cpp — Ferramenta única de build/empacotamento (LFS-friendly)
-// Autor: ChatGPT (GPT-5 Thinking)
+// Autor: fcanata
 // Licença: MIT
 //
 // Recursos principais:
@@ -11,7 +11,7 @@
 //  - install: instala via DESTDIR em staging, strip (ELF only), gera pacote (tar.zst/xz),
 //             registra lista de arquivos e instala no sistema (fakeroot opcional)
 //  - package: gera pacote a partir do staging sem instalar no sistema
-//  - remove: desinstala usando lista de arquivos registrada
+//  - remove: desinstala usando lista de arquivos registrada (agora apaga .meta/.files)
 //  - clean: remove work/logs/staging do pacote
 //  - upgrade/reinstall: conveniências
 //  - verify: verifica sha256 de um arquivo
@@ -20,6 +20,7 @@
 //  - revdep: ldd para detectar libs ausentes e sugerir pacotes
 //  - hooks: pre/post de várias fases (fetch, extract, build, install, package, remove, clean)
 //  - sync: versão, commit e push (git) do conteúdo (repo/logs/packages/work) com opções
+//  - deps: resolução automática com ordenação topológica (install) e reversa (remove --recursive)
 //  - CLI consistente: nomes longos, curtos e numéricos (0 help; 1 fetch; 2 extract; 3 build;
 //                     4 test; 5 install; 6 package; 7 remove; 8 upgrade; 9 reinstall;
 //                     10 clean; 11 info; 12 search; 13 verify; 14 revdep; 15 sync)
@@ -38,8 +39,10 @@
 //
 // Compilação: g++ -std=c++17 -O2 -pthread -o mbuild mbuild.cpp
 //
-// Observação: o programa usa popen/pclose para executar comandos do sistema.
-// Testado em Linux com g++ >= 9 e libstdc++ com std::filesystem.
+// Observações:
+// - Programa usa popen/pclose para comandos de sistema. Testado em Linux.
+// - Suporte a dependências: lê campo `deps=` do .meta do pacote (ex.: `deps=zlib,openssl`).
+//   Se ausente, não presume dependência.
 
 #include <algorithm>
 #include <atomic>
@@ -104,6 +107,8 @@ struct Config {
     bool verbose = false;
     bool do_strip = true;
     bool use_fakeroot = false;
+    bool auto_deps = true;       // NOVO: instalar dependências automaticamente
+    bool remove_recursive = false; // NOVO: remover dependentes antes (se flag passada)
     int jobs = std::max(1u, std::thread::hardware_concurrency());
     std::string strip_flags = "-s";
     std::string package_format = "zst"; // "zst" ou "xz"
@@ -307,6 +312,76 @@ static std::map<std::string,std::string> metaGetAll(const std::string& name){
     return kv;
 }
 
+// ========================= Dependências (grafo) =========================
+static std::vector<std::string> split_csv(const std::string& s){
+    std::vector<std::string> out;
+    std::string buf;
+    std::istringstream iss(s);
+    while(std::getline(iss, buf, ',')){
+        // trim
+        size_t a=0, b=buf.size();
+        while(a<b && std::isspace((unsigned char)buf[a])) a++;
+        while(b>a && std::isspace((unsigned char)buf[b-1])) b--;
+        if(b>a) out.push_back(buf.substr(a,b-a));
+    }
+    return out;
+}
+
+static std::vector<std::string> getDeps(const std::string& name){
+    auto kv = metaGetAll(name);
+    if(!kv.count("deps")) return {};
+    return split_csv(kv["deps"]);
+}
+
+static bool isInstalled(const std::string& name){
+    return fileExists(filesPath(name)) && fileExists(metaPath(name));
+}
+
+// Constrói conjunto de deps (fecho transitivo)
+static void gatherDepsDFS(const std::string& name, std::set<std::string>& seen, std::vector<std::string>& order){
+    if(seen.count(name)) return;
+    seen.insert(name);
+    for(const auto& d: getDeps(name)){
+        gatherDepsDFS(d, seen, order);
+    }
+    order.push_back(name); // pós-ordem: deps primeiro, depois o pacote
+}
+
+// Ordenação topológica (lista final tem deps antes do alvo)
+static std::vector<std::string> topoOrderForInstall(const std::string& name){
+    std::set<std::string> seen;
+    std::vector<std::string> post;
+    gatherDepsDFS(name, seen, post);
+    return post; // já está deps -> ... -> name
+}
+
+// Encontrar quem depende de X (reverse edges) varrendo metas do repo
+static std::set<std::string> findDependentsOf(const std::string& target){
+    std::set<std::string> users;
+    if(!fileExists(CFG.repo)) return users;
+    for(auto& e: fs::directory_iterator(CFG.repo)){
+        if(!e.is_regular_file()) continue;
+        if(e.path().extension()!=".meta") continue;
+        std::string name = e.path().stem().string();
+        auto deps = getDeps(name);
+        for(auto& d: deps){
+            if(d == target) users.insert(name);
+        }
+    }
+    return users;
+}
+
+// Remoção recursiva (dependentes antes)
+static void gatherReverseRemoval(const std::string& name, std::set<std::string>& seen, std::vector<std::string>& order){
+    if(seen.count(name)) return;
+    seen.insert(name);
+    auto users = findDependentsOf(name);
+    for(const auto& u: users){
+        gatherReverseRemoval(u, seen, order);
+    }
+    order.push_back(name); // dependentes primeiro, depois o alvo
+}
+
 // ========================= Config (env + rc) =========================
 static void loadConfig(){
     std::string home_dir = Config::envOr("HOME","/root");
@@ -334,6 +409,8 @@ static void loadConfig(){
     if(fk){ std::string v(fk); CFG.use_fakeroot = (v=="1"||v=="true"||v=="on"); }
     const char* gr = std::getenv("MBUILD_GIT_REMOTE"); if(gr) CFG.git_remote = gr;
     const char* gb = std::getenv("MBUILD_GIT_BRANCH"); if(gb) CFG.git_branch = gb;
+    const char* ad = std::getenv("MBUILD_AUTO_DEPS"); if(ad){ std::string v(ad); CFG.auto_deps = (v!="0"&&v!="false"&&v!="off"); }
+    const char* rr = std::getenv("MBUILD_REMOVE_RECURSIVE"); if(rr){ std::string v(rr); CFG.remove_recursive = (v=="1"||v=="true"||v=="on"); }
 
     // carregar rc (~/.mbuildrc ou $MBUILD_HOME/config)
     fs::path rc = fs::path(home_dir)/".mbuildrc";
@@ -356,6 +433,8 @@ static void loadConfig(){
             else if(k=="fakeroot"){ CFG.use_fakeroot = (v=="1"||v=="true"||v=="on"); }
             else if(k=="git_remote"){ CFG.git_remote = v; }
             else if(k=="git_branch"){ CFG.git_branch = v; }
+            else if(k=="auto_deps"){ CFG.auto_deps = (v=="1"||v=="true"||v=="on"); }
+            else if(k=="remove_recursive"){ CFG.remove_recursive = (v=="1"||v=="true"||v=="on"); }
         }
     }
 }
@@ -371,17 +450,24 @@ static void initDirs(){
     ensureDir(CFG.staging);
 }
 
-static void runHooks(const std::string& phase, const std::string& name, const fs::path& log){
+static int runHooks(const std::string& phase, const std::string& name, const fs::path& log){
     fs::path hooksDir = CFG.home/"hooks"/phase;
-    if(!fileExists(hooksDir)) return;
+    if(!fileExists(hooksDir)) return 0;
+    int rc_total = 0;
     for(auto& e: fs::directory_iterator(hooksDir)){
         if(!e.is_regular_file()) continue;
         fs::perms p = fs::status(e.path()).permissions();
         if((p & fs::perms::owner_exec) == fs::perms::none) continue;
         std::string cmd = "'" + e.path().string() + "' '" + name + "'";
         logInfo("Hook "+phase+": "+e.path().filename().string());
-        runCmd(cmd, log);
+        int rc = runCmd(cmd, log);
+        rc_total |= rc;
+        if(rc!=0){
+            logErr("Hook falhou: "+e.path().filename().string());
+            return rc_total; // interrompe a fase se hook falhar
+        }
     }
+    return rc_total;
 }
 
 // ========================= Fases de instalação / pacote =========================
@@ -436,7 +522,7 @@ static int action_fetch(const std::string& src, const std::optional<std::string>
     fs::path log = CFG.logs/name/(timestamp_compact()+"-fetch.log");
     int rc=0;
 
-    runHooks("pre-fetch", name, log);
+    if(int hrc = runHooks("pre-fetch", name, log); hrc!=0) return hrc;
 
     if(isGitUrl(src)){
         fs::path dst = CFG.sources/name;
@@ -482,7 +568,7 @@ static int action_extract(const std::string& input, const std::optional<std::str
     fs::path outdir = CFG.work/name; ensureDir(outdir);
     fs::path log = CFG.logs/name/(timestamp_compact()+"-extract.log");
 
-    runHooks("pre-extract", name, log);
+    if(int hrc = runHooks("pre-extract", name, log); hrc!=0) return hrc;
 
     std::string kind = detectArchiveType(input);
     int rc=0;
@@ -509,7 +595,7 @@ static int action_build(const std::string& name){
     fs::path workdir = meta.count("workdir")? fs::path(meta["workdir"]) : CFG.work/name;
     fs::path srcdir = firstOrOnlySubdir(workdir);
 
-    runHooks("pre-build", name, log);
+    if(int hrc = runHooks("pre-build", name, log); hrc!=0) return hrc;
 
     auto runIn = [&](const std::string& c){ return runCmd("bash -lc 'cd " + srcdir.string() + " && " + c + "'", log, false); };
     int rc=0;
@@ -569,7 +655,7 @@ static int stage_install(const std::string& name, fs::path& out_stage, fs::path&
     ensureDir(stage);
     out_stage = stage;
 
-    runHooks("pre-install", name, log);
+    if(int hrc = runHooks("pre-install", name, log); hrc!=0) return hrc;
 
     auto runIn = [&](const std::string& c){ return runCmd("bash -lc 'cd " + srcdir.string() + " && " + c + "'", log, false); };
 
@@ -609,19 +695,8 @@ static int stage_install(const std::string& name, fs::path& out_stage, fs::path&
     return rc;
 }
 
-static int action_install(const std::string& name){
-    // dependências declaradas em meta (opcional: deps=foo,bar)
-    auto meta = metaGetAll(name);
-    if (meta.count("deps")){
-        std::istringstream iss(meta["deps"]); std::string dep;
-        while(std::getline(iss, dep, ',')){
-            if(dep.empty()) continue;
-            if(!fileExists(metaPath(dep))){
-                logErr("Dependência não instalada: " + dep);
-                return 1;
-            }
-        }
-    }
+// ==== Auxiliar: instala 1 pacote (sem deps), com rollback básico se falhar ====
+static int install_single_with_packaging(const std::string& name){
     fs::path stage, srcdir, slog;
     int rc = stage_install(name, stage, srcdir, slog);
     if(rc!=0){ logErr("Falha ao instalar no staging"); return rc; }
@@ -634,20 +709,54 @@ static int action_install(const std::string& name){
     rc = package_stage(name, stage, pkgfile, slog);
     if(rc!=0){ logErr("Falha ao empacotar"); return rc; }
 
-    // registra lista
+    // registra lista de arquivos com base no stage (serve para rollback)
     record_filelist_from_stage(name, stage, slog);
 
     // instala no sistema
     rc = install_stage_to_system(name, stage, slog);
-    if(rc!=0){ logErr("Falha ao instalar no destino"); return rc; }
+    if(rc!=0){
+        logErr("Falha ao instalar no destino — iniciando rollback parcial...");
+        // tenta remover usando a lista (pode não corresponder 1:1 se falhou muito cedo)
+        fs::path filelist = filesPath(name);
+        if(fileExists(filelist)){
+            std::ifstream in(filelist); std::string rel;
+            while(std::getline(in, rel)){
+                fs::path p = fs::path(CFG.destdir)/rel;
+                if(fileExists(p)) runCmd("rm -f '" + p.string() + "'", slog);
+            }
+        }
+        return rc;
+    }
 
     runHooks("post-install", name, slog);
     return 0;
 }
 
+static int action_install_with_deps(const std::string& name){
+    // Resolve deps topologicamente
+    std::vector<std::string> order = CFG.auto_deps ? topoOrderForInstall(name) : std::vector<std::string>{name};
+    // Instala na ordem; pula os já instalados
+    for(const auto& pkg: order){
+        if(pkg!=name && !CFG.auto_deps) continue; // segurança
+        if(isInstalled(pkg)){
+            logInfo("Já instalado (pulado): " + pkg);
+            continue;
+        }
+        int rc = install_single_with_packaging(pkg);
+        if(rc!=0) return rc;
+    }
+    return 0;
+}
+static int action_install(const std::string& name){
+    // Antes: apenas verificava deps e abortava. Agora: instala deps automaticamente (configurável).
+    // Se o .meta do pacote tiver deps=foo,bar, serão instaladas primeiro.
+    return action_install_with_deps(name);
+}
+
 static int action_package(const std::string& name){
     auto meta = metaGetAll(name);
     fs::path workdir = meta.count("workdir")? fs::path(meta["workdir"]) : CFG.work/name;
+    (void)workdir;
     fs::path stage = CFG.staging/name;
     fs::path srcdir, slog;
 
@@ -656,7 +765,7 @@ static int action_package(const std::string& name){
         if(rc!=0){ logErr("Falha ao preparar staging para pacote"); return rc; }
     } else {
         slog = CFG.logs/name/(timestamp_compact()+"-package.log");
-        runHooks("pre-package", name, slog);
+        if(int hrc = runHooks("pre-package", name, slog); hrc!=0) return hrc;
     }
 
     // strip e empacota
@@ -673,14 +782,14 @@ static int action_package(const std::string& name){
     return 0;
 }
 
-static int action_remove(const std::string& name){
+static int action_remove_single(const std::string& name){
     ensureDir(CFG.logs);
     fs::path log = CFG.logs/name/(timestamp_compact()+"-remove.log");
 
     fs::path filelist = filesPath(name);
     if(!fileExists(filelist)){ logErr("Lista de arquivos não encontrada: " + filelist.string()); return 1; }
 
-    runHooks("pre-remove", name, log);
+    if(int hrc = runHooks("pre-remove", name, log); hrc!=0) return hrc;
 
     std::ifstream in(filelist); std::string rel;
     int rc_total=0;
@@ -695,15 +804,36 @@ static int action_remove(const std::string& name){
     std::string clean = "bash -lc 'sort -r \"" + filelist.string() + "\" | xargs -I{} dirname {} | sort -u | while read d; do rmdir -p --ignore-fail-on-non-empty \"" + CFG.destdir + "/$d\" 2>/dev/null || true; done'";
     runCmd(clean, log);
 
+    // APAGAR metadados e lista
+    std::error_code ec;
+    fs::remove(metaPath(name), ec);
+    fs::remove(filesPath(name), ec);
+
     runHooks("post-remove", name, log);
     logInfo("Remoção concluída: " + name);
+    return rc_total;
+}
+
+static int action_remove(const std::string& name){
+    if(!CFG.remove_recursive){
+        return action_remove_single(name);
+    }
+    // Remoção recursiva em ordem reversa: primeiro quem depende de 'name', depois 'name'
+    std::set<std::string> seen;
+    std::vector<std::string> order;
+    gatherReverseRemoval(name, seen, order);
+    int rc_total = 0;
+    for(const auto& n: order){
+        logInfo(std::string("Removendo (ordem reversa): ")+n);
+        rc_total |= action_remove_single(n);
+    }
     return rc_total;
 }
 
 static int action_clean(const std::string& name){
     ensureDir(CFG.logs);
     fs::path log = CFG.logs/name/(timestamp_compact()+"-clean.log");
-    runHooks("pre-clean", name, log);
+    if(int hrc = runHooks("pre-clean", name, log); hrc!=0) return hrc;
     std::error_code ec;
     fs::remove_all(CFG.work/name, ec);
     fs::remove_all(CFG.logs/name, ec);
@@ -808,7 +938,7 @@ static int action_revdep(const std::string& name){
 }
 
 // ========================= Sync (git) =========================
-// Escopos: repo | logs | packages | work | all
+// Escopos: repo | logs | packages | work | sources | all
 static int action_sync(const std::string& scope, const std::optional<std::string>& message,
                        const std::optional<std::string>& remoteOpt, const std::optional<std::string>& branchOpt,
                        bool push, bool init_repo)
@@ -895,9 +1025,10 @@ static void usage(){
 "  test <NAME>             | t   | 4   — rodar testes\n"
 "  install <NAME>          | i   | 5   — instalar (staging→pacote→sistema)\n"
 "      [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]\n"
+"      [--with-deps|--no-deps]\n"
 "  package <NAME>          | p   | 6   — gerar pacote a partir do staging [--format zst|xz]\n"
-"  remove <NAME>           | rm  | 7   — remover arquivos instalados\n"
-"  upgrade <NAME>          | up  | 8   — remove + install\n"
+"  remove <NAME>           | rm  | 7   — remover arquivos instalados [--recursive]\n"
+"  upgrade <NAME>          | up  | 8   — remove + install (com deps se habilitado)\n"
 "  reinstall <NAME>        | ri  | 9   — install novamente\n"
 "  clean <NAME>            | c   | 10  — limpar work/logs/staging do pacote\n"
 "  info <NAME>             |     | 11  — exibir metadados do pacote\n"
@@ -908,7 +1039,8 @@ static void usage(){
 "      escopo: repo|logs|packages|work|sources|all (default: repo)\n"
 "      opções: --message MSG --remote URL --branch BR --push|--no-push --init\n"
 "\n"
-"Flags globais (antes/depois do comando): --color | --no-color | --no-spinner | --quiet | --verbose\n"
+"Flags globais: --color | --no-color | --no-spinner | --quiet | --verbose\n"
+"Env/RC extras: auto_deps="<<(CFG.auto_deps?"on":"off")<<"  remove_recursive="<<(CFG.remove_recursive?"on":"off")<<"\n"
 "Dirs ativos:\n"
 "  home="<<CFG.home<<"\n"
 "  sources="<<CFG.sources<<"  work="<<CFG.work<<"  logs="<<CFG.logs<<"\n"
@@ -1002,7 +1134,7 @@ int main(int argc, char** argv){
         return action_test(args.front());
     }
     if(cmd=="install"){
-        if(args.empty()){ logErr("Uso: install <name> [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]"); return 2; }
+        if(args.empty()){ logErr("Uso: install <name> [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz] [--with-deps|--no-deps]"); return 2; }
         std::string name = args.front(); args.erase(args.begin());
         if(eatFlag("--fakeroot")) CFG.use_fakeroot=true;
         if(eatFlag("--no-strip")) CFG.do_strip=false;
@@ -1010,6 +1142,8 @@ int main(int argc, char** argv){
         if(auto f=getOpt("--strip-flags")) CFG.strip_flags=*f;
         if(auto d=getOpt("--destdir"))    CFG.destdir=*d;
         if(auto fmt=getOpt("--format"))   CFG.package_format=(*fmt=="xz"?"xz":"zst");
+        if(eatFlag("--no-deps")) CFG.auto_deps=false;
+        if(eatFlag("--with-deps")) CFG.auto_deps=true;
         return action_install(name);
     }
     if(cmd=="package"){
@@ -1019,8 +1153,10 @@ int main(int argc, char** argv){
         return action_package(name);
     }
     if(cmd=="remove"){
-        if(args.empty()){ logErr("Uso: remove <name>"); return 2; }
-        return action_remove(args.front());
+        if(args.empty()){ logErr("Uso: remove <name> [--recursive]"); return 2; }
+        std::string name = args.front(); args.erase(args.begin());
+        if(eatFlag("--recursive")) CFG.remove_recursive = true;
+        return action_remove(name);
     }
     if(cmd=="upgrade"){
         if(args.empty()){ logErr("Uso: upgrade <name>"); return 2; }
