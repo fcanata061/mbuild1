@@ -1,0 +1,7 @@
+# ~/.mbuildrc
+color=true
+spinner=true
+jobs=8
+strip_flags=-s
+destdir=/
+package_format=zst
