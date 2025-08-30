@@ -1,28 +1,25 @@
 #include <bits/stdc++.h>
 #include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <map>
-#include <set>
-#include <vector>
-#include <queue>
 #include <openssl/sha.h>
+#include <zlib.h>     // para compressão
+#include <unistd.h>   // fork/exec
+#include <sys/wait.h>
 
 namespace fs = std::filesystem;
 
-// ========================= Configurações globais =========================
+// ========================= Configuração =========================
 struct Config {
-    std::string home = "/var/lib/pkgmgr";
-    std::string sources = home + "/sources";
-    std::string work = home + "/work";
-    std::string logs = home + "/logs";
-    std::string repo = home + "/repo";
-    std::string bin = home + "/bin";
-    std::string staging = home + "/staging";
-    std::string destdir = "/";
-    int jobs = 4;
+    std::string home      = fs::current_path().string();
+    std::string sources   = "sources";
+    std::string work      = "work";
+    std::string logs      = "logs";
+    std::string repo      = "repo";
+    std::string bin       = "packages";
+    std::string staging   = "staging";
+    std::string destdir   = "/";
+    int jobs              = 4;
     std::string strip_flags = "-s";
-    std::string package_format = "xz";
+    std::string package_format = "xz"; // xz | zst
     std::string git_remote = "";
     std::string git_branch = "main";
 } CFG;
@@ -32,785 +29,748 @@ struct PackageMeta {
     std::string name;
     std::string version;
     std::vector<std::string> deps;
+    std::string source;
     std::string sha256;
-    std::string source_url;
 };
 
-// Banco de dados local de pacotes instalados
-struct DB {
+struct PackageDB {
     std::map<std::string, PackageMeta> installed;
 } DBSTATE;
 
-// ========================= Funções utilitárias =========================
-static std::string sha256sum(const std::string &filename) {
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    char buf[8192];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    std::ifstream file(filename, std::ios::binary);
+// ========================= Utilitários =========================
+std::string sha256sum(const std::string& path) {
+    FILE* file = fopen(path.c_str(), "rb");
     if (!file) return "";
-    while (file.good()) {
-        file.read(buf, sizeof(buf));
-        SHA256_Update(&sha256, buf, file.gcount());
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), file)) > 0) {
+        SHA256_Update(&ctx, buf, n);
     }
-    SHA256_Final(hash, &sha256);
-    std::ostringstream result;
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        result << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
-    }
-    return result.str();
+    fclose(file);
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash, &ctx);
+    std::ostringstream oss;
+    for (int i=0;i<SHA256_DIGEST_LENGTH;i++)
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    return oss.str();
 }
 
-static bool runCommand(const std::string &cmd) {
-    std::cout << "[CMD] " << cmd << "\n";
-    int ret = system(cmd.c_str());
-    return ret == 0;
+bool runCommand(const std::string& cmd, const std::string& logfile="") {
+    std::string full = cmd;
+    if (!logfile.empty())
+        full += " >>" + logfile + " 2>&1";
+    int ret = system(full.c_str());
+    return WEXITSTATUS(ret) == 0;
 }
 
-// ========================= Banco de dados =========================
-static void db_load() {
-    std::string dbfile = CFG.home + "/db.txt";
+// ========================= Banco de Dados =========================
+void db_load() {
+    std::string dbfile = CFG.repo + "/db.txt";
+    if (!fs::exists(dbfile)) return;
     std::ifstream in(dbfile);
-    if (!in) return;
     std::string line;
-    while (std::getline(in, line)) {
-        std::istringstream ss(line);
-        PackageMeta meta;
-        ss >> meta.name >> meta.version;
+    while (std::getline(in,line)) {
+        std::istringstream iss(line);
+        PackageMeta m;
+        std::getline(iss,m.name,':');
+        std::getline(iss,m.version,':');
         std::string deps;
-        ss >> deps;
-        std::stringstream depstream(deps);
+        std::getline(iss,deps,':');
+        std::getline(iss,m.source,':');
+        std::getline(iss,m.sha256,':');
+        std::istringstream ds(deps);
         std::string d;
-        while (std::getline(depstream, d, ',')) {
-            if (!d.empty()) meta.deps.push_back(d);
+        while (std::getline(ds,d,',')) if(!d.empty()) m.deps.push_back(d);
+        DBSTATE.installed[m.name] = m;
+    }
+}
+void db_save() {
+    fs::create_directories(CFG.repo);
+    std::ofstream out(CFG.repo + "/db.txt");
+    for (auto& [n,m] : DBSTATE.installed) {
+        out << m.name << ":" << m.version << ":";
+        for (size_t i=0;i<m.deps.size();i++) {
+            out << m.deps[i]; if(i+1<m.deps.size()) out << ",";
         }
-        DBSTATE.installed[meta.name] = meta;
+        out << ":" << m.source << ":" << m.sha256 << "\n";
     }
 }
 
-static void db_save() {
-    std::string dbfile = CFG.home + "/db.txt";
-    std::ofstream out(dbfile);
-    for (auto &p : DBSTATE.installed) {
-        out << p.second.name << " " << p.second.version << " ";
-        for (size_t i = 0; i < p.second.deps.size(); i++) {
-            out << p.second.deps[i];
-            if (i + 1 < p.second.deps.size()) out << ",";
-        }
-        out << "\n";
-    }
-}
-
-// ========================= Parser de metadados =========================
-static PackageMeta parseMeta(const std::string &path) {
-    PackageMeta meta;
+// ========================= Parser de Metadados =========================
+PackageMeta parseMeta(const std::string& path) {
+    PackageMeta m;
     std::ifstream in(path);
-    if (!in) return meta;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.rfind("name=", 0) == 0) meta.name = line.substr(5);
-        else if (line.rfind("version=", 0) == 0) meta.version = line.substr(8);
-        else if (line.rfind("deps=", 0) == 0) {
-            std::string deps = line.substr(5);
-            std::stringstream ss(deps);
+    std::string k,v;
+    while (in>>k>>v) {
+        if (k=="name:") m.name=v;
+        else if (k=="version:") m.version=v;
+        else if (k=="depends:") {
+            std::istringstream ss(v);
             std::string d;
-            while (std::getline(ss, d, ',')) {
-                if (!d.empty()) meta.deps.push_back(d);
-            }
-        } else if (line.rfind("sha256=", 0) == 0) meta.sha256 = line.substr(7);
-        else if (line.rfind("source=", 0) == 0) meta.source_url = line.substr(7);
+            while (std::getline(ss,d,',')) m.deps.push_back(d);
+        }
+        else if (k=="source:") m.source=v;
+        else if (k=="sha256:") m.sha256=v;
     }
-    return meta;
+    return m;
 }
 
-// ========================= Resolução de dependências =========================
-static std::vector<std::string> topoSort(const std::map<std::string, PackageMeta> &metas, const std::string &target) {
-    std::map<std::string, std::set<std::string>> graph;
-    std::map<std::string, int> indeg;
-
-    // Construir grafo
-    for (auto &p : metas) {
-        for (auto &d : p.second.deps) {
-            graph[d]; // garante nó
-            graph[p.first].insert(d);
+// ========================= Resolução de Dependências =========================
+bool topoSort(const std::string& pkg, 
+              const std::map<std::string,PackageMeta>& repo, 
+              std::vector<std::string>& order) {
+    std::set<std::string> visited, stack;
+    std::function<bool(const std::string&)> dfs = [&](const std::string& u){
+        if (stack.count(u)) return false; 
+        if (visited.count(u)) return true;
+        stack.insert(u);
+        auto it=repo.find(u);
+        if(it!=repo.end()) {
+            for(auto& d:it->second.deps) if(!dfs(d)) return false;
         }
-    }
-    for (auto &g : graph) {
-        if (!indeg.count(g.first)) indeg[g.first] = 0;
-        for (auto &d : g.second) indeg[d]++;
-    }
-
-    std::queue<std::string> q;
-    for (auto &p : indeg) if (p.second == 0) q.push(p.first);
-
-    std::vector<std::string> order;
-    while (!q.empty()) {
-        std::string u = q.front(); q.pop();
+        stack.erase(u);
+        visited.insert(u);
         order.push_back(u);
-        for (auto &d : graph[u]) {
-            if (--indeg[d] == 0) q.push(d);
-        }
-    }
-
-    // manter apenas dependências do alvo
-    std::set<std::string> needed;
-    std::function<void(const std::string&)> dfs = [&](const std::string &pkg){
-        if (needed.count(pkg)) return;
-        needed.insert(pkg);
-        for (auto &d : metas.at(pkg).deps) dfs(d);
+        return true;
     };
-    dfs(target);
-
-    std::vector<std::string> filtered;
-    for (auto &p : order) if (needed.count(p)) filtered.push_back(p);
-    return filtered;
-}
-// ========================= Parte 2 — helpers extra & ações =========================
-
-static void ensureDir(const fs::path& p){ std::error_code ec; fs::create_directories(p, ec); }
-static bool fileExists(const fs::path& p){ std::error_code ec; return fs::exists(p, ec); }
-
-// flags ajustáveis por CLI
-static bool G_USE_FAKEROOT = false;
-static bool G_DO_STRIP = true;
-
-// captura saída de comando
-static std::string execCapture(const std::string& cmd){
-    std::array<char, 4096> buf{};
-    std::string out;
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if(!pipe) return out;
-    while(fgets(buf.data(), buf.size(), pipe)) out.append(buf.data());
-    pclose(pipe);
-    return out;
+    return dfs(pkg);
 }
 
-static std::string now_ts(const char* fmt="%Y%m%d-%H%M%S"){
-    std::time_t t = std::time(nullptr);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    char b[64]; std::strftime(b, sizeof(b), fmt, &tm);
-    return b;
+// ========================= Rollback Helper =========================
+void rollbackInstall(const std::string& pkg) {
+    std::cerr << "[rollback] revertendo " << pkg << "\n";
+    DBSTATE.installed.erase(pkg);
+    db_save();
+    fs::remove_all(CFG.staging + "/" + pkg);
+    fs::remove_all(CFG.work + "/" + pkg);
+}
+// ========================= Helpers de FS/Exec/Logs =========================
+static inline std::string pjoin(const std::string& a, const std::string& b){
+    return (fs::path(a)/b).string();
+}
+static inline bool existsf(const std::string& p){ return fs::exists(p); }
+static inline void ensuredir(const std::string& p){ fs::create_directories(p); }
+static inline std::string timestamp(){
+    std::time_t t=std::time(nullptr);
+    char buf[32];
+    std::strftime(buf,sizeof(buf),"%Y%m%d-%H%M%S",std::localtime(&t));
+    return buf;
+}
+static inline std::string logPath(const std::string& pkg, const std::string& phase){
+    ensuredir(CFG.logs);
+    ensuredir(pjoin(CFG.logs, pkg));
+    return pjoin(pjoin(CFG.logs, pkg), timestamp()+"-"+phase+".log");
+}
+static inline bool toolExists(const std::string& tool){
+    std::string cmd = "sh -c \"command -v "+tool+" >/dev/null 2>&1\"";
+    return WEXITSTATUS(system(cmd.c_str()))==0;
 }
 
-// logging simples
-static void logInfo(const std::string& s){ std::cerr<<"[*] "<<s<<"\n"; }
-static void logWarn(const std::string& s){ std::cerr<<"[!] "<<s<<"\n"; }
-static void logErr (const std::string& s){ std::cerr<<"[x] "<<s<<"\n"; }
-
-// caminhos auxiliares
-static fs::path metaPath(const std::string& name){ return fs::path(CFG.repo) / (name + ".meta"); }
-static fs::path filesPath(const std::string& name){ return fs::path(CFG.repo) / (name + ".files"); }
-static fs::path stageDir (const std::string& name){ return fs::path(CFG.staging) / name; }
-static fs::path workDir  (const std::string& name){ return fs::path(CFG.work) / name; }
-static fs::path logDir   (const std::string& name){ return fs::path(CFG.logs) / name; }
-
-static bool isUrl(const std::string& s){
-    return s.rfind("http://",0)==0 || s.rfind("https://",0)==0;
+// Envelopa comando com logging + exibição
+static bool runLogged(const std::string& cmd, const std::string& logfile){
+    std::string wrapped = cmd + " >>'" + logfile + "' 2>&1";
+    int rc = system(wrapped.c_str());
+    return WEXITSTATUS(rc)==0;
 }
-static bool isGit(const std::string& s){
-    if(s.rfind("git@",0)==0) return true;
-    if(s.rfind("ssh://",0)==0) return true;
-    if(s.rfind("https://",0)==0 && s.find(".git")!=std::string::npos) return true;
-    if(s.size()>4 && s.substr(s.size()-4)==".git") return true;
-    return false;
-}
-static std::string detectArchiveType(const std::string& f){
-    if(std::regex_search(f, std::regex("\\.(tar\\.(gz|bz2|xz|zst))$"))) return "tar";
-    if(std::regex_search(f, std::regex("\\.(tgz|tbz2|txz)$"))) return "tar";
-    if(std::regex_search(f, std::regex("\\.zip$"))) return "zip";
-    if(std::regex_search(f, std::regex("\\.7z$"))) return "7z";
+
+// ========================= Detecção de Arquivo/Arquivador =========================
+static std::string detectArchive(const std::string& path){
+    std::string s=path;
+    if(std::regex_search(s, std::regex("\\.(tar\\.(gz|bz2|xz|zst))$"))) return "tar";
+    if(std::regex_search(s, std::regex("\\.(tgz|tbz2|txz)$"))) return "tar";
+    if(std::regex_search(s, std::regex("\\.zip$"))) return "zip";
+    if(std::regex_search(s, std::regex("\\.7z$"))) return "7z";
     return "dir";
 }
 
-// hooks: $home/hooks/<phase>/*
-static void runHooks(const std::string& phase, const std::string& name){
-    fs::path hooksDir = fs::path(CFG.home)/"hooks"/phase;
-    if(!fileExists(hooksDir)) return;
-    for(auto& e: fs::directory_iterator(hooksDir)){
-        if(!e.is_regular_file()) continue;
-        std::string cmd = "'" + e.path().string() + "' '" + name + "'";
-        runCommand(cmd);
+// ========================= I/O dos .files por pacote =========================
+static std::string filesListPath(const std::string& pkg){
+    ensuredir(CFG.repo);
+    return pjoin(CFG.repo, pkg + ".files");
+}
+static std::set<std::string> readFilesList(const std::string& pkg){
+    std::set<std::string> r;
+    std::ifstream in(filesListPath(pkg));
+    std::string line;
+    while(std::getline(in,line)){
+        if(!line.empty()) r.insert(line);
+    }
+    return r;
+}
+static void writeFilesList(const std::string& pkg, const std::vector<std::string>& files){
+    ensuredir(CFG.repo);
+    std::ofstream out(filesListPath(pkg));
+    for(auto& f: files) out<<f<<"\n";
+}
+
+// Lista recursiva relativa ao stage root
+static void collectRelativeFiles(const std::string& root, std::vector<std::string>& out){
+    for(auto& e: fs::recursive_directory_iterator(root)){
+        if(fs::is_regular_file(e.path()) || fs::is_symlink(e.path())){
+            std::string rel = fs::relative(e.path(), root).generic_string();
+            if(rel.empty()) continue;
+            out.push_back(rel);
+        }
+    }
+    std::sort(out.begin(), out.end());
+}
+
+// ========================= Conflitos de Arquivos =========================
+// Regras: conflito se:
+//  - arquivo de stage colide com arquivo já instalado por OUTRO pacote (.files de terceiros)
+//  - arquivo existe no filesystem DESTDIR (p.e. base do sistema) e não pertence a este pacote
+static std::vector<std::string> detectConflicts(const std::string& pkg,
+                                                const std::vector<std::string>& stageFiles){
+    std::vector<std::string> conflicts;
+    // Carrega todas as listas de arquivos de pacotes instalados (exceto o próprio)
+    std::map<std::string, std::set<std::string>> others;
+    for(auto& ent: fs::directory_iterator(CFG.repo)){
+        if(!ent.is_regular_file()) continue;
+        auto p = ent.path();
+        if(p.extension() == ".files"){
+            std::string name = p.stem().string();
+            if(name==pkg) continue;
+            auto it = DBSTATE.installed.find(name);
+            if(it==DBSTATE.installed.end()) continue; // só pacotes instalados
+            others[name] = readFilesList(name);
+        }
+    }
+    // Verifica conflitos
+    for(auto& rel: stageFiles){
+        std::string absPath = pjoin(CFG.destdir, rel);
+        // Se o arquivo pertence a outro pacote
+        for(auto& [oname, fl]: others){
+            if(fl.count(rel)){
+                conflicts.push_back(rel + " (pertence a " + oname + ")");
+                break;
+            }
+        }
+        // Se existe no FS e não pertence a ninguém
+        if(existsf(absPath)){
+            // verifica se já pertence a este pacote (reinstalação)
+            auto cur = readFilesList(pkg);
+            if(!cur.count(rel)){
+                conflicts.push_back(rel + " (já existe no sistema)");
+            }
+        }
+    }
+    return conflicts;
+}
+
+// ========================= Empacotamento =========================
+static bool packStage(const std::string& pkg, const std::string& stageDir,
+                      std::string& outPkgFile, const std::string& log){
+    ensuredir(CFG.repo);
+    std::string suffix = (CFG.package_format=="zst" ? "tar.zst" : "tar.xz");
+    outPkgFile = pjoin(CFG.repo, pkg + "-" + timestamp() + "." + suffix);
+    std::string cmd;
+    if(CFG.package_format=="zst"){
+        if(!toolExists("zstd")){
+            std::cerr<<"[erro] zstd não encontrado no PATH.\n";
+            return false;
+        }
+        cmd = "sh -c \"cd '"+stageDir+"' && tar -I 'zstd -T0 -19' -cf '"+outPkgFile+"' .\"";
+    }else{
+        // xz padrão
+        cmd = "sh -c \"cd '"+stageDir+"' && tar -Jcf '"+outPkgFile+"' .\"";
+    }
+    return runLogged(cmd, log);
+}
+
+// ========================= Instalação no sistema (com fakeroot opcional) =========================
+static bool installToSystem(const std::string& stageDir, bool use_fakeroot, const std::string& log){
+    // verificação do fakeroot (evolução 5)
+    if(use_fakeroot){
+        if(!toolExists("fakeroot")){
+            std::cerr<<"[erro] --fakeroot solicitado, mas 'fakeroot' não está disponível.\n";
+            return false;
+        }
+    }
+    std::string pipe_cmd = "sh -c \"cd '"+stageDir+"' && tar -cpf - . | ";
+    if(use_fakeroot) pipe_cmd += "fakeroot ";
+    pipe_cmd += "tar -C '"+CFG.destdir+"' -xpf -\"";
+    return runLogged(pipe_cmd, log);
+}
+
+// ========================= Fase: fetch =========================
+static bool action_fetch(const std::string& src, const std::string& pkg, const std::string& shaOpt){
+    ensuredir(CFG.sources);
+    std::string log = logPath(pkg, "fetch");
+
+    // detecta: git URL, http(s), dir local
+    auto isGit = [&](const std::string& s){
+        if(s.rfind("git@",0)==0) return true;
+        if(s.rfind("ssh://",0)==0) return true;
+        if(s.find(".git")!=std::string::npos) return true;
+        return false;
+    };
+    auto isUrl = [&](const std::string& s){
+        return s.rfind("http://",0)==0 || s.rfind("https://",0)==0;
+    };
+
+    if(isGit(src)){
+        // clone ou pull
+        std::string dst = pjoin(CFG.sources, pkg);
+        if(existsf(dst)){
+            return runLogged("git -C '"+dst+"' pull --ff-only", log);
+        }else{
+            return runLogged("git clone --depth 1 '"+src+"' '"+dst+"'", log);
+        }
+    } else if(isUrl(src)) {
+        std::string base = fs::path(src).filename().string();
+        std::string out = pjoin(CFG.sources, base);
+        if(!existsf(out)){
+            if(!runLogged("curl -L --fail -o '"+out+"' '"+src+"'", log)) return false;
+        }
+        if(!shaOpt.empty()){
+            std::string calc = sha256sum(out);
+            if(calc != shaOpt){
+                std::ofstream lf(log, std::ios::app);
+                lf<<"[erro] SHA256 esperado="<<shaOpt<<" obtido="<<calc<<"\n";
+                return false;
+            }
+        }
+        return true;
+    } else {
+        // diretório local → copia em cache
+        std::string dst = pjoin(CFG.sources, pkg);
+        ensuredir(dst);
+        std::string cmd = "sh -c \"cp -a '"+src+"'/.' '"+dst+"'\"";
+        return runLogged(cmd, log);
     }
 }
 
-// carrega meta de um pacote no repo
-static bool loadMetaFile(const std::string& name, PackageMeta& out){
-    fs::path mp = metaPath(name);
-    if(!fileExists(mp)){ logErr("Meta não encontrado: " + mp.string()); return false; }
-    out = parseMeta(mp.string());
-    if(out.name.empty()) out.name = name;
+// ========================= Fase: extract =========================
+static bool action_extract(const std::string& input, const std::string& pkg){
+    ensuredir(CFG.work);
+    std::string outdir = pjoin(CFG.work, pkg);
+    ensuredir(outdir);
+    std::string log = logPath(pkg, "extract");
+    std::string kind = detectArchive(input);
+    if(kind=="tar"){
+        return runLogged("tar -C '"+outdir+"' -xf '"+input+"'", log);
+    } else if(kind=="zip"){
+        return runLogged("unzip -q -d '"+outdir+"' '"+input+"'", log);
+    } else if(kind=="7z"){
+        return runLogged("7z x -o'"+outdir+"' '"+input+"'", log);
+    } else { // dir
+        return runLogged("sh -c \"cp -a '"+input+"'/.' '"+outdir+"'\"", log);
+    }
+}
+
+// ========================= Fase: build (com logs e -j) =========================
+static bool action_build(const std::string& pkg, int jobs){
+    std::string log = logPath(pkg, "build");
+    std::string workdir = pjoin(CFG.work, pkg);
+
+    // se houver único subdir, entra nele
+    auto firstOrOnlySubdir = [&](const std::string& root)->std::string{
+        int dirs=0; std::string last=root;
+        for(auto& e: fs::directory_iterator(root)){
+            if(fs::is_directory(e.path())){ dirs++; last = e.path().string(); }
+        }
+        if(dirs==1) return last;
+        return root;
+    };
+    std::string srcdir = firstOrOnlySubdir(workdir);
+
+    auto runIn = [&](const std::string& c){
+        return runLogged("sh -c \"cd '"+srcdir+"' && "+c+"\"", log);
+    };
+
+    // autodetecta buildsystem (evolução mantida)
+    if(existsf(pjoin(srcdir,"build.sh"))){
+        if(!runIn("chmod +x build.sh && ./build.sh -j"+std::to_string(jobs))) return false;
+    } else if(existsf(pjoin(srcdir,"autogen.sh"))){
+        if(!runIn("chmod +x autogen.sh && ./autogen.sh")) return false;
+        if(!runIn("./configure --prefix=/usr")) return false;
+        if(!runIn("make -j"+std::to_string(jobs))) return false;
+    } else if(existsf(pjoin(srcdir,"configure"))){
+        if(!runIn("./configure --prefix=/usr")) return false;
+        if(!runIn("make -j"+std::to_string(jobs))) return false;
+    } else if(existsf(pjoin(srcdir,"CMakeLists.txt"))){
+        if(!runIn("mkdir -p build && cd build && cmake -DCMAKE_INSTALL_PREFIX=/usr ..")) return false;
+        if(!runIn("cd build && make -j"+std::to_string(jobs))) return false;
+    } else if(existsf(pjoin(srcdir,"meson.build"))){
+        if(!runIn("meson setup build --prefix=/usr")) return false;
+        if(!runIn("ninja -C build -j"+std::to_string(jobs))) return false;
+    } else if(existsf(pjoin(srcdir,"setup.py"))){
+        if(!runIn("python3 setup.py build")) return false;
+    } else if(existsf(pjoin(srcdir,"pyproject.toml"))){
+        if(!runIn("pip3 wheel . -w dist")) return false;
+    } else if(existsf(pjoin(srcdir,"Cargo.toml"))){
+        if(!runIn("cargo build --release -j"+std::to_string(jobs))) return false;
+    } else if(existsf(pjoin(srcdir,"go.mod"))){
+        if(!runIn("go build ./...")) return false;
+    } else if(existsf(pjoin(srcdir,"Makefile"))){
+        if(!runIn("make -j"+std::to_string(jobs))) return false;
+    } else {
+        std::ofstream lf(log, std::ios::app);
+        lf<<"[aviso] Nenhum sistema de build detectado, ignorando.\n";
+    }
     return true;
 }
 
-// coleta recursivamente os metas necessários
-static void collectMetasRec(const std::string& pkg,
-                            std::map<std::string, PackageMeta>& metas,
-                            std::set<std::string>& vis)
-{
-    if(vis.count(pkg)) return;
-    vis.insert(pkg);
-    PackageMeta m;
-    if(!loadMetaFile(pkg, m)) return;
-    metas[m.name] = m;
-    for(auto& d: m.deps) collectMetasRec(d, metas, vis);
-}
+// ========================= Fase: test (make check/test, ninja test, cargo test) =========================
+static bool action_test(const std::string& pkg){
+    std::string log = logPath(pkg, "test");
+    std::string workdir = pjoin(CFG.work, pkg);
 
-static std::map<std::string, PackageMeta> collectMetas(const std::string& root){
-    std::map<std::string, PackageMeta> metas;
-    std::set<std::string> vis;
-    collectMetasRec(root, metas, vis);
-    return metas;
-}
-
-// primeiro subdir se houver só 1
-static fs::path firstOrOnlySubdir(const fs::path& root){
-    int dirs=0; fs::path last;
-    for(auto& e: fs::directory_iterator(root)){
-        if(e.is_directory()){ dirs++; last = e.path(); }
-    }
-    if(dirs==1) return last;
-    return root;
-}
-
-// lista de arquivos de um stage (relativa)
-static void record_filelist_from_stage(const std::string& name, const fs::path& stage){
-    ensureDir(CFG.repo);
-    std::ofstream out(filesPath(name));
-    if(!out) return;
-    auto base = stage.string();
-    for(auto& e: fs::recursive_directory_iterator(stage)){
-        if(!e.is_regular_file() && !e.is_symlink()) continue;
-        std::string full = e.path().string();
-        if(full.rfind(base,0)==0){
-            std::string rel = full.substr(base.size());
-            if(!rel.empty() && rel[0]=='/') rel.erase(rel.begin());
-            out << rel << "\n";
+    auto firstOrOnlySubdir = [&](const std::string& root)->std::string{
+        int dirs=0; std::string last=root;
+        for(auto& e: fs::directory_iterator(root)){
+            if(fs::is_directory(e.path())){ dirs++; last = e.path().string(); }
         }
+        if(dirs==1) return last;
+        return root;
+    };
+    std::string srcdir = firstOrOnlySubdir(workdir);
+
+    auto runIn = [&](const std::string& c){
+        return runLogged("sh -c \"cd '"+srcdir+"' && "+c+"\"", log);
+    };
+
+    // evolução 6: execuções reais porém não-fatais
+    bool any=false, ok=true;
+    if(existsf(pjoin(srcdir,"Makefile"))){
+        any=true; ok = runIn("make check || make test || true") && ok;
     }
+    if(existsf(pjoin(srcdir,"build")) && existsf(pjoin(pjoin(srcdir,"build"),"build.ninja"))){
+        any=true; ok = runIn("ninja -C build test || true") && ok;
+    }
+    if(existsf(pjoin(srcdir,"Cargo.toml"))){
+        any=true; ok = runIn("cargo test || true") && ok;
+    }
+    if(!any){
+        std::ofstream lf(log, std::ios::app);
+        lf<<"[info] Sem testes detectados.\n";
+    }
+    return ok;
 }
 
-// strip ELF (no staging)
-static void do_strip_stage(const fs::path& stage){
-    if(!G_DO_STRIP) return;
+// ========================= Strip stage =========================
+static void stripStage(const std::string& stageDir, const std::string& log){
     std::string cmd =
-        "bash -lc '"
-        "find \"" + stage.string() + "\" -type f -exec sh -c '"
+        "sh -c \"find '"+stageDir+"' -type f -exec sh -c '"
         "mt=$(file -b --mime-type \"$1\"); "
         "if [ \"$mt\" = application/x-executable ] || "
         "[ \"$mt\" = application/x-pie-executable ] || "
         "[ \"$mt\" = application/x-sharedlib ]; then "
-        "strip " + CFG.strip_flags + " \"$1\" || true; "
-        "fi' _ {} \\;"
-        "'";
-    runCommand(cmd);
+        "strip "+CFG.strip_flags+" \"$1\" || true; "
+        "fi' _ {} \\;\"";
+    runLogged(cmd, log);
 }
 
-// empacotar stage -> repo/<name>-<ts>.tar.<xz|zst>
-static fs::path package_stage(const std::string& name, const fs::path& stage){
-    ensureDir(CFG.repo);
-    std::string ts = now_ts();
-    fs::path pkg = fs::path(CFG.repo)/(name + "-" + ts + ".tar." + (CFG.package_format=="xz"?"xz":"zst"));
-    std::string tarcmd;
-    if(CFG.package_format=="xz")
-        tarcmd = "tar -C '" + stage.string() + "' -Jcf '" + pkg.string() + "' .";
-    else
-        tarcmd = "tar -C '" + stage.string() + "' -I 'zstd -T0 -19' -cf '" + pkg.string() + "' .";
-    if(!runCommand(tarcmd)){ logErr("Falha ao empacotar stage"); return ""; }
-    return pkg;
+// ========================= Fase: stage + install =========================
+static bool stage_install(const std::string& pkg, std::string& stageDir, std::vector<std::string>& stagedFiles){
+    std::string log = logPath(pkg, "install");
+    std::string workdir = pjoin(CFG.work, pkg);
+
+    auto firstOrOnlySubdir = [&](const std::string& root)->std::string{
+        int dirs=0; std::string last=root;
+        for(auto& e: fs::directory_iterator(root)){
+            if(fs::is_directory(e.path())){ dirs++; last = e.path().string(); }
+        }
+        if(dirs==1) return last;
+        return root;
+    };
+    std::string srcdir = firstOrOnlySubdir(workdir);
+
+    stageDir = pjoin(CFG.staging, pkg);
+    ensuredir(stageDir);
+
+    auto runIn = [&](const std::string& c){
+        return runLogged("sh -c \"cd '"+srcdir+"' && "+c+"\"", log);
+    };
+
+    bool ok=false;
+    if(existsf(pjoin(srcdir,"build")) && existsf(pjoin(pjoin(srcdir,"build"),"build.ninja"))){
+        ok = runIn("ninja -C build install DESTDIR='"+stageDir+"'");
+    } else if(existsf(pjoin(srcdir,"CMakeLists.txt")) && existsf(pjoin(srcdir,"build"))){
+        ok = runIn("cd build && make install DESTDIR='"+stageDir+"'");
+    } else if(existsf(pjoin(srcdir,"setup.py"))){
+        ok = runIn("python3 setup.py install --root='"+stageDir+"' --prefix=/usr");
+    } else if(existsf(pjoin(srcdir,"pyproject.toml"))){
+        ok = runIn("pip3 install . --prefix=/usr --root='"+stageDir+"'");
+    } else if(existsf(pjoin(srcdir,"Cargo.toml"))){
+        ok = runIn("cargo build --release -j"+std::to_string(CFG.jobs));
+        if(ok){
+            std::string copyBins =
+                "sh -c \"mkdir -p '"+pjoin(stageDir,"/usr/bin")+
+                "'; for f in target/release/*; do if [ -f \\\"$f\\\" ] && "
+                "file -b \\\"$f\\\" | grep -qi executable; then cp -a \\\"$f\\\" '"+pjoin(stageDir,"/usr/bin/")+
+                "'; fi; done\"";
+            ok = runLogged(copyBins, log);
+        }
+    } else if(existsf(pjoin(srcdir,"go.mod"))){
+        ok = runIn("go build ./...");
+        if(ok){
+            std::string copyBins =
+                "sh -c \"mkdir -p '"+pjoin(stageDir,"/usr/bin")+
+                "'; for f in $(find . -maxdepth 1 -type f); do if file -b \\\"$f\\\" | grep -qi executable; then cp -a \\\"$f\\\" '"+pjoin(stageDir,"/usr/bin/")+"'; fi; done\"";
+            ok = runLogged(copyBins, log);
+        }
+    } else {
+        ok = runIn("make install DESTDIR='"+stageDir+"'");
+    }
+    if(!ok) return false;
+
+    // strip (evolução 4/partial de otimização)
+    stripStage(stageDir, log);
+
+    // lista arquivos do stage
+    collectRelativeFiles(stageDir, stagedFiles);
+    return true;
 }
 
-// instalar stage no sistema (destdir)
-static bool install_stage_to_system(const fs::path& stage){
-    std::string cmd = "tar -C '" + stage.string() + "' -cpf - . | ";
-    if(G_USE_FAKEROOT) cmd += "fakeroot ";
-    cmd += "tar -C '" + CFG.destdir + "' -xpf -";
-    return runCommand(cmd);
+// ========================= Instalação completa (com rollback e conflitos) =========================
+static bool action_install_full(const std::string& pkg, bool use_fakeroot){
+    std::string log = logPath(pkg, "install-all");
+    std::string stageDir; std::vector<std::string> staged;
+    if(!stage_install(pkg, stageDir, staged)){
+        std::ofstream lf(log, std::ios::app); lf<<"[erro] stage_install falhou.\n";
+        rollbackInstall(pkg);
+        return false;
+    }
+
+    // evolução 2: detectar conflitos
+    auto conflicts = detectConflicts(pkg, staged);
+    if(!conflicts.empty()){
+        std::ofstream lf(log, std::ios::app);
+        lf<<"[erro] Conflitos detectados:\n";
+        for(auto& c: conflicts) lf<<"  - "<<c<<"\n";
+        // rollback e aborta
+        rollbackInstall(pkg);
+        return false;
+    }
+
+    // evolução 1: rollback se falhar instalação real
+    if(!installToSystem(stageDir, use_fakeroot, log)){
+        rollbackInstall(pkg);
+        return false;
+    }
+
+    // registra lista de arquivos
+    writeFilesList(pkg, staged);
+    return true;
 }
 
-// conflito de arquivos com pacotes já instalados (usa .files do repo)
-static bool checkFileConflicts(const std::string& name, const fs::path& stage){
-    // coleta alvos que serão escritos
-    std::set<std::string> will;
-    auto base = stage.string();
-    for(auto& e: fs::recursive_directory_iterator(stage)){
-        if(!e.is_regular_file() && !e.is_symlink()) continue;
-        std::string full = e.path().string();
-        if(full.rfind(base,0)==0){
-            std::string rel = full.substr(base.size());
-            if(!rel.empty() && rel[0]=='/') rel.erase(rel.begin());
-            will.insert(rel);
+// ========================= Empacotar sem instalar =========================
+static bool action_package(const std::string& pkg){
+    std::string log = logPath(pkg, "package");
+    std::string stageDir = pjoin(CFG.staging, pkg);
+    if(!(existsf(stageDir) && !fs::is_empty(stageDir))){
+        // tenta criar via stage_install
+        std::vector<std::string> staged;
+        if(!stage_install(pkg, stageDir, staged)){
+            std::ofstream lf(log, std::ios::app); lf<<"[erro] stage_install falhou.\n";
+            return false;
         }
     }
-    // checa em todos os .files
+    std::string pkgfile;
+    if(!packStage(pkg, stageDir, pkgfile, log)) return false;
+    std::ofstream lf(log, std::ios::app);
+    lf<<"[ok] Pacote criado: "<<pkgfile<<"\n";
+    return true;
+}
+
+// ========================= Remoção reversa =========================
+static bool action_remove(const std::string& pkg){
+    std::string log = logPath(pkg, "remove");
+    // Carrega lista
+    auto files = readFilesList(pkg);
+    if(files.empty()){
+        std::ofstream lf(log, std::ios::app); lf<<"[erro] "+pkg+" sem .files registrado.\n";
+        return false;
+    }
+    // Remove arquivos
+    bool ok=true;
+    for(auto it = files.rbegin(); it!=files.rend(); ++it){
+        std::string abs = pjoin(CFG.destdir, *it);
+        if(existsf(abs)){
+            std::string cmd = "rm -f '"+abs+"'";
+            if(!runLogged(cmd, log)) ok=false;
+        }
+    }
+    // Limpa diretórios vazios
+    std::string clean = "sh -c \"sort -r '"+filesListPath(pkg)+"' | xargs -I{} dirname {} | sort -u | "
+                        "while read d; do rmdir -p --ignore-fail-on-non-empty '"+CFG.destdir+"/'$d 2>/dev/null || true; done\"";
+    runLogged(clean, log);
+
+    // Atualiza DB e apaga .files
+    DBSTATE.installed.erase(pkg);
+    db_save();
+    std::error_code ec;
+    fs::remove(filesListPath(pkg), ec);
+
+    std::ofstream lf(log, std::ios::app);
+    lf<<"[ok] Remoção concluída: "<<pkg<<"\n";
+    return ok;
+}
+
+// ========================= Upgrade / Reinstall =========================
+static bool action_upgrade(const std::string& pkg, bool use_fakeroot){
+    if(!action_remove(pkg)) return false;
+    return action_install_full(pkg, use_fakeroot);
+}
+static bool action_reinstall(const std::string& pkg, bool use_fakeroot){
+    return action_install_full(pkg, use_fakeroot);
+}
+
+// ========================= Verify SHA256 =========================
+static bool action_verify(const std::string& file, const std::string& expect){
+    std::string log = logPath("verify", "sha256");
+    std::string got = sha256sum(file);
+    std::ofstream lf(log, std::ios::app);
+    lf<<"file="<<file<<" expect="<<expect<<" got="<<got<<"\n";
+    bool ok = (got==expect);
+    if(!ok) std::cerr<<"[erro] SHA256 não confere.\n";
+    else std::cout<<"SHA256 OK\n";
+    return ok;
+}
+
+// ========================= Info / Search =========================
+static void action_info(const std::string& pkg){
+    auto it = DBSTATE.installed.find(pkg);
+    if(it == DBSTATE.installed.end()){
+        std::cerr<<"Pacote não instalado: "<<pkg<<"\n"; return;
+    }
+    auto& m = it->second;
+    std::cout<<"Nome: "<<m.name<<"\n";
+    std::cout<<"Versão: "<<m.version<<"\n";
+    std::cout<<"Source: "<<m.source<<"\n";
+    std::cout<<"SHA256: "<<m.sha256<<"\n";
+    std::cout<<"Deps: ";
+    for(size_t i=0;i<m.deps.size();++i){
+        std::cout<<m.deps[i]<<(i+1<m.deps.size()?",":"");
+    }
+    std::cout<<"\nArquivos: "<<filesListPath(pkg)<<"\n";
+}
+
+static void action_search(const std::string& term){
+    for(auto& [n,m]: DBSTATE.installed){
+        if(n.find(term)!=std::string::npos || m.source.find(term)!=std::string::npos){
+            std::cout<<n<<"\n";
+            continue;
+        }
+        for(auto& d: m.deps){
+            if(d.find(term)!=std::string::npos){ std::cout<<n<<"\n"; break; }
+        }
+    }
+}
+
+// ========================= Revdep (ldd) =========================
+static void action_revdep(const std::string& pkg){
+    auto fl = readFilesList(pkg);
+    if(fl.empty()){
+        std::cerr<<"Sem .files para "<<pkg<<"\n"; return;
+    }
+    std::set<std::string> missing;
+    for(auto& rel: fl){
+        std::string p = pjoin(CFG.destdir, rel);
+        if(!existsf(p)) continue;
+        // apenas binários/so
+        std::string chk = "sh -c \"file -b '"+p+"' | grep -qiE 'executable|shared object'\"";
+        if(WEXITSTATUS(system(chk.c_str()))!=0) continue;
+        // ldd
+        std::string cmd = "sh -c \"ldd '"+p+"' 2>/dev/null | awk '/not found/{print $1}'\"";
+        FILE* fp = popen(cmd.c_str(), "r");
+        if(!fp) continue;
+        char buf[512]; std::string out;
+        while(fgets(buf,sizeof(buf),fp)) out += buf;
+        pclose(fp);
+        std::istringstream iss(out); std::string lib;
+        while(iss>>lib) missing.insert(lib);
+    }
+    if(missing.empty()){
+        std::cout<<"Sem dependências ausentes.\n"; return;
+    }
+    std::cout<<"Bibliotecas ausentes:\n";
+    for(auto& l: missing) std::cout<<"  "<<l<<"\n";
+
+    std::cout<<"Sugestões (pacotes contendo .so):\n";
     for(auto& ent: fs::directory_iterator(CFG.repo)){
         if(ent.path().extension()!=".files") continue;
-        std::string other = ent.path().stem().string();
-        if(other==name) continue;
         std::ifstream in(ent.path());
         std::string rel;
-        while(std::getline(in, rel)){
-            if(will.count(rel)){
-                logErr("Conflito de arquivo: " + rel + " já pertence a " + other);
-                return false;
+        std::set<std::string> libs;
+        while(std::getline(in,rel)){
+            if(rel.find(".so")!=std::string::npos) libs.insert(fs::path(rel).filename().string());
+        }
+        for(auto& miss: missing){
+            for(auto& have: libs){
+                if(have.rfind(miss,0)==0){
+                    std::cout<<"  - "<<ent.path().stem().string()<<" (tem "<<have<<")\n";
+                }
             }
+        }
+    }
+}
+
+// ========================= Sync (git) =========================
+static bool action_sync(const std::string& scope, const std::string& message,
+                        const std::string& remote, const std::string& branch,
+                        bool push, bool init_repo){
+    std::string root = CFG.home;
+    ensuredir(root);
+    auto run = [&](const std::string& c){
+        std::string log = logPath("sync","git");
+        return runLogged(c, log);
+    };
+
+    if(init_repo && !existsf(pjoin(root,".git"))){
+        if(!run("git -C '"+root+"' init")) return false;
+        if(!remote.empty()){
+            run("git -C '"+root+"' remote remove origin >/dev/null 2>&1 || true");
+            if(!run("git -C '"+root+"' remote add origin '"+remote+"'")) return false;
+        } else if(!CFG.git_remote.empty()){
+            run("git -C '"+root+"' remote remove origin >/dev/null 2>&1 || true");
+            run("git -C '"+root+"' remote add origin '"+CFG.git_remote+"'");
+        }
+    }
+
+    // .gitignore mínimo
+    if(!existsf(pjoin(root,".gitignore"))){
+        std::ofstream gi(pjoin(root,".gitignore"));
+        gi<<"# mbuild defaults\n*.tmp\n.cache/\n";
+    }
+
+    // caminhos
+    std::vector<std::string> paths;
+    if(scope=="all") paths = {CFG.repo, CFG.logs, CFG.work, CFG.sources, CFG.bin, CFG.staging};
+    else if(scope=="repo"||scope=="packages"||scope=="pkgs") paths = {CFG.repo};
+    else if(scope=="logs") paths = {CFG.logs};
+    else if(scope=="work") paths = {CFG.work};
+    else if(scope=="sources") paths = {CFG.sources};
+    else paths = {CFG.repo};
+
+    for(auto& p: paths){
+        if(!existsf(p)) continue;
+        run("git -C '"+root+"' add -A '"+fs::relative(p, root).string()+"'");
+    }
+
+    std::string msg = message.empty()? ("mbuild sync: "+timestamp()) : message;
+    run("sh -c \"cd '"+root+"' && git diff --cached --quiet || git commit -m '"+msg+"'\"");
+
+    std::string rem = remote.empty()? CFG.git_remote : remote;
+    std::string br  = branch.empty()? CFG.git_branch  : branch;
+    if(push){
+        if(rem.empty()){
+            std::cerr<<"[sync] remote vazio; pulando push.\n";
+            return true;
+        }
+        run("sh -c \"cd '"+root+"' && git symbolic-ref -q HEAD || git checkout -b '"+br+"'\"");
+        if(!run("git -C '"+root+"' push -u '"+rem+"' '"+br+"'")){
+            std::cerr<<"git push falhou.\n";
+            return false;
         }
     }
     return true;
 }
 
-// ========================= Ações =========================
-
-// fetch: SRC pode ser url (curl), git, ou diretório local
-static int action_fetch(const std::string& src, const std::optional<std::string>& nameOpt, const std::optional<std::string>& sha){
-    ensureDir(CFG.sources); ensureDir(CFG.logs);
-    std::string name;
-    if(nameOpt) name = *nameOpt;
-    else{
-        // usa basename
-        auto pos = src.find_last_of('/');
-        name = (pos==std::string::npos) ? src : src.substr(pos+1);
-        if(auto p = name.find(".git"); p!=std::string::npos) name = name.substr(0,p);
-    }
-
-    fs::path logf = logDir(name)/(now_ts()+"-fetch.log");
-    ensureDir(logf.parent_path());
-
-    runHooks("pre-fetch", name);
-
-    int rc = 0;
-    if(isGit(src)){
-        fs::path dst = fs::path(CFG.sources)/name;
-        if(fileExists(dst))
-            rc = runCommand("git -C '" + dst.string() + "' pull --ff-only") ? 0:1;
-        else
-            rc = runCommand("git clone --depth 1 '" + src + "' '" + dst.string() + "'") ? 0:1;
-        if(rc==0) logInfo("Git OK: " + name);
-    } else if(isUrl(src)){
-        fs::path out = fs::path(CFG.sources) / (name);
-        if(!fileExists(out)){
-            rc = runCommand("curl -L --fail -o '" + out.string() + "' '" + src + "'") ? 0:1;
-        }else{
-            logInfo("Usando cache existente: " + out.string());
-        }
-        if(rc==0 && sha){
-            std::string sum = sha256sum(out.string());
-            if(sum != *sha){ logErr("SHA256 não confere"); rc=1; }
-        }
-    } else {
-        // diretório local -> copia
-        fs::path dst = fs::path(CFG.sources)/name;
-        ensureDir(dst);
-        rc = runCommand("cp -a '" + src + "'/* '" + dst.string() + "'/") ? 0:1;
-    }
-
-    runHooks("post-fetch", name);
-    return rc;
-}
-
-static int action_extract(const std::string& input, const std::optional<std::string>& nameOpt){
-    ensureDir(CFG.work); ensureDir(CFG.logs);
-    std::string name = nameOpt.value_or([&]{
-        auto pos = input.find_last_of('/'); return (pos==std::string::npos)? input : input.substr(pos+1);
-    }());
-    fs::path outdir = workDir(name); ensureDir(outdir);
-
-    runHooks("pre-extract", name);
-
-    std::string kind = detectArchiveType(input);
-    int rc=0;
-    if(kind=="tar")      rc = runCommand("tar -C '" + outdir.string() + "' -xf '" + input + "'")?0:1;
-    else if(kind=="zip") rc = runCommand("unzip -q -d '" + outdir.string() + "' '" + input + "'")?0:1;
-    else if(kind=="7z")  rc = runCommand("7z x -o'" + outdir.string() + "' '" + input + "'")?0:1;
-    else                 rc = runCommand("cp -a '" + fs::path(input).string() + "'/* '" + outdir.string() + "'/")?0:1;
-
-    runHooks("post-extract", name);
-    return rc;
-}
-
-static int action_build(const std::string& name){
-    ensureDir(CFG.logs);
-    runHooks("pre-build", name);
-
-    fs::path srcdir = firstOrOnlySubdir(workDir(name));
-    auto runIn = [&](const std::string& c){ return runCommand("bash -lc 'cd " + srcdir.string() + " && " + c + "'"); };
-
-    int rc=0;
-    if(fileExists(srcdir/"build.sh")){
-        rc = runIn("chmod +x build.sh && ./build.sh -j" + std::to_string(CFG.jobs))?0:1;
-    } else if(fileExists(srcdir/"autogen.sh")){
-        rc = runIn("chmod +x autogen.sh && ./autogen.sh && ./configure --prefix=/usr && make -j"+std::to_string(CFG.jobs))?0:1;
-    } else if(fileExists(srcdir/"configure")){
-        rc = runIn("./configure --prefix=/usr && make -j"+std::to_string(CFG.jobs))?0:1;
-    } else if(fileExists(srcdir/"CMakeLists.txt")){
-        rc = runIn("mkdir -p build && cd build && cmake -DCMAKE_INSTALL_PREFIX=/usr .. && make -j"+std::to_string(CFG.jobs))?0:1;
-    } else if(fileExists(srcdir/"meson.build")){
-        rc = runIn("meson setup build --prefix=/usr && ninja -C build -j"+std::to_string(CFG.jobs))?0:1;
-    } else if(fileExists(srcdir/"setup.py")){
-        rc = runIn("python3 setup.py build")?0:1;
-    } else if(fileExists(srcdir/"pyproject.toml")){
-        rc = runIn("pip3 wheel . -w dist")?0:1;
-    } else if(fileExists(srcdir/"Cargo.toml")){
-        rc = runIn("cargo build --release -j"+std::to_string(CFG.jobs))?0:1;
-    } else if(fileExists(srcdir/"go.mod")){
-        rc = runIn("go build ./...")?0:1;
-    } else if(fileExists(srcdir/"Makefile")){
-        rc = runIn("make -j"+std::to_string(CFG.jobs))?0:1;
-    } else {
-        logWarn("Nenhum sistema de build detectado.");
-    }
-
-    runHooks("post-build", name);
-    return rc;
-}
-
-static int action_test(const std::string& name){
-    runHooks("pre-test", name);
-    fs::path srcdir = firstOrOnlySubdir(workDir(name));
-    auto runIn = [&](const std::string& c){ return runCommand("bash -lc 'cd " + srcdir.string() + " && " + c + "'"); };
-    int rc=0;
-    if(fileExists(srcdir/"Makefile")) rc = (runIn("make check || make test || true")?0:1);
-    else if(fileExists(srcdir/"build"/"build.ninja")) rc = (runIn("ninja -C build test || true")?0:1);
-    else if(fileExists(srcdir/"Cargo.toml")) rc = (runIn("cargo test || true")?0:1);
-    else logWarn("Nenhum teste encontrado.");
-    runHooks("post-test", name);
-    return rc;
-}
-
-// instala no STAGING (não no sistema ainda)
-static int stage_install(const std::string& name, fs::path& out_stage){
-    fs::path srcdir = firstOrOnlySubdir(workDir(name));
-    fs::path stage = stageDir(name); ensureDir(stage);
-    out_stage = stage;
-
-    runHooks("pre-install", name);
-
-    auto runIn = [&](const std::string& c){ return runCommand("bash -lc 'cd " + srcdir.string() + " && " + c + "'"); };
-
-    int rc=0;
-    if(fileExists(srcdir/"build"/"build.ninja")){
-        rc = runIn("ninja -C build install DESTDIR='" + stage.string() + "'")?0:1;
-    } else if(fileExists(srcdir/"CMakeLists.txt") && fileExists(srcdir/"build")){
-        rc = runIn("cd build && make install DESTDIR='" + stage.string() + "'")?0:1;
-    } else if(fileExists(srcdir/"setup.py")){
-        rc = runIn("python3 setup.py install --root='" + stage.string() + "' --prefix=/usr")?0:1;
-    } else if(fileExists(srcdir/"pyproject.toml")){
-        rc = runIn("pip3 install . --prefix=/usr --root='" + stage.string() + "'")?0:1;
-    } else if(fileExists(srcdir/"Cargo.toml")){
-        rc = runIn("cargo build --release -j"+std::to_string(CFG.jobs))?0:1;
-        if(rc==0){
-            std::string copyBins =
-                "bash -lc 'mkdir -p \"" + stage.string() + "/usr/bin\"; "
-                "for f in target/release/*; do "
-                "  if [ -f \"$f\" ] && file -b \"$f\" | grep -qi executable; then cp -a \"$f\" \"" + stage.string() + "/usr/bin/\"; fi; "
-                "done'";
-            rc = runCommand(copyBins)?0:1;
-        }
-    } else if(fileExists(srcdir/"go.mod")){
-        rc = runIn("go build ./...")?0:1;
-        if(rc==0){
-            std::string copyBins =
-                "bash -lc 'mkdir -p \"" + stage.string() + "/usr/bin\"; "
-                "for f in $(find . -maxdepth 1 -type f); do "
-                "  if file -b \"$f\" | grep -qi executable; then cp -a \"$f\" \"" + stage.string() + "/usr/bin/\"; fi; "
-                "done'";
-            rc = runCommand(copyBins)?0:1;
-        }
-    } else {
-        rc = runIn("make install DESTDIR='" + stage.string() + "'")?0:1;
-    }
-
-    return rc;
-}
-
-static int action_package(const std::string& name){
-    fs::path stage;
-    if(!fileExists(stageDir(name)) || fs::is_empty(stageDir(name))){
-        int rc = stage_install(name, stage);
-        if(rc!=0){ logErr("Falha ao preparar staging para pacote"); return rc; }
-    } else {
-        stage = stageDir(name);
-        runHooks("pre-package", name);
-    }
-
-    do_strip_stage(stage);
-
-    fs::path pkgfile = package_stage(name, stage);
-    if(pkgfile.empty()) return 1;
-
-    record_filelist_from_stage(name, stage);
-
-    runHooks("post-package", name);
-    logInfo("Pacote criado (sem instalar): " + pkgfile.string());
-    return 0;
-}
-
-static int action_install_one(const std::string& name){
-    // build + stage + strip + package + filelist + install to system
-    int rc=0;
-    rc = action_build(name); if(rc!=0) return rc;
-    rc = action_test(name);  if(rc!=0) logWarn("Testes falharam/ausentes — seguindo.");
-
-    fs::path stage;
-    rc = stage_install(name, stage); if(rc!=0){ logErr("Falha ao instalar no staging"); return rc; }
-
-    // checa conflitos
-    if(!checkFileConflicts(name, stage)){ logErr("Conflitos detectados"); return 1; }
-
-    do_strip_stage(stage);
-
-    fs::path pkgfile = package_stage(name, stage);
-    if(pkgfile.empty()) return 1;
-
-    record_filelist_from_stage(name, stage);
-
-    // instala no sistema
-    if(!install_stage_to_system(stage)){ logErr("Falha ao instalar no destino"); return 1; }
-
-    runHooks("post-install", name);
-
-    // atualiza DB de instalados
-    PackageMeta m; if(loadMetaFile(name, m)){
-        DBSTATE.installed[name] = m; db_save();
-    }
-    logInfo("Instalação concluída: " + name);
-    return 0;
-}
-
-// remove usando .files
-static int action_remove(const std::string& name){
-    runHooks("pre-remove", name);
-    fs::path list = filesPath(name);
-    if(!fileExists(list)){ logErr("Lista de arquivos não encontrada: " + list.string()); return 1; }
-    std::ifstream in(list);
-    std::string rel;
-    while(std::getline(in, rel)){
-        fs::path p = fs::path(CFG.destdir)/rel;
-        std::error_code ec;
-        fs::remove(p, ec); // ignora erro
-    }
-    // tenta limpar diretórios vazios
-    std::string clean = "bash -lc 'sort -r \"" + list.string() + "\" | xargs -I{} dirname {} | sort -u | while read d; do rmdir -p --ignore-fail-on-non-empty \"" + CFG.destdir + "/$d\" 2>/dev/null || true; done'";
-    runCommand(clean);
-
-    DBSTATE.installed.erase(name);
-    db_save();
-
-    runHooks("post-remove", name);
-    logInfo("Remoção concluída: " + name);
-    return 0;
-}
-
-// upgrade = remove + install
-static int action_upgrade(const std::string& name){
-    int rc = action_remove(name);
-    if(rc!=0) return rc;
-    return action_install_one(name);
-}
-
-static int action_reinstall(const std::string& name){
-    return action_install_one(name);
-}
-
-// limpa work/log/stage
-static int action_clean(const std::string& name){
-    runHooks("pre-clean", name);
-    std::error_code ec;
-    fs::remove_all(workDir(name), ec);
-    fs::remove_all(logDir(name), ec);
-    fs::remove_all(stageDir(name), ec);
-    runHooks("post-clean", name);
-    logInfo("Clean concluído: " + name);
-    return 0;
-}
-
-static int action_info(const std::string& name){
-    PackageMeta m;
-    if(!loadMetaFile(name, m)) return 1;
-    std::cout<<"Nome: "<<m.name<<"\n";
-    std::cout<<"Versão: "<<m.version<<"\n";
-    std::cout<<"Fonte: "<<m.source_url<<"\n";
-    std::cout<<"SHA256: "<<m.sha256<<"\n";
-    std::cout<<"Deps:";
-    for(size_t i=0;i<m.deps.size();++i){
-        std::cout<<(i?", ":" ")<<m.deps[i];
-    }
-    std::cout<<"\n";
-    fs::path fl = filesPath(name);
-    if(fileExists(fl)) std::cout<<"Arquivos (.files): "<<fl.string()<<"\n";
-    return 0;
-}
-
-static int action_search(const std::string& term){
-    for(auto& e: fs::directory_iterator(CFG.repo)){
-        if(!e.is_regular_file()) continue;
-        if(e.path().extension()==".meta"){
-            std::string nm = e.path().stem().string();
-            if(nm.find(term)!=std::string::npos){
-                std::cout<<nm<<"\n"; continue;
-            }
-            PackageMeta m = parseMeta(e.path().string());
-            if(m.source_url.find(term)!=std::string::npos) std::cout<<nm<<"\n";
-        }
-    }
-    return 0;
-}
-
-static int action_verify(const std::string& file, const std::string& sum){
-    std::string got = sha256sum(file);
-    if(got.empty()){ logErr("Falha ao ler arquivo"); return 1; }
-    if(got==sum){ logInfo("SHA256 OK"); return 0; }
-    logErr("SHA256 não confere.\nEsperado: "+sum+"\nObtido:  "+got);
-    return 2;
-}
-
-// revdep: usa ldd para encontrar "not found"
-static int action_revdep(const std::string& name){
-    fs::path list = filesPath(name);
-    if(!fileExists(list)){ logErr("Sem .files; gere package/instale primeiro."); return 1; }
-    std::ifstream in(list);
-    std::string rel;
-    std::set<std::string> missing;
-    while(std::getline(in, rel)){
-        fs::path p = fs::path(CFG.destdir)/rel;
-        if(!fileExists(p)) continue;
-        // checa se é ELF
-        std::string type = execCapture("file -b \"" + p.string() + "\"");
-        if(type.find("executable")==std::string::npos && type.find("shared object")==std::string::npos) continue;
-        std::string out = execCapture("ldd \"" + p.string() + "\" 2>/dev/null | awk '/not found/{print $1}'");
-        std::istringstream iss(out);
-        std::string lib;
-        while(iss>>lib) missing.insert(lib);
-    }
-    if(missing.empty()){ logInfo("Sem dependências ausentes detectadas."); return 0; }
-    logWarn("Bibliotecas ausentes:");
-    for(auto& l: missing) std::cout<<"  "<<l<<"\n";
-
-    logInfo("Possíveis pacotes que fornecem libs compatíveis:");
-    for(auto& e: fs::directory_iterator(CFG.repo)){
-        if(e.path().extension()==".files"){
-            std::ifstream f(e.path());
-            std::string r; std::set<std::string> libs;
-            while(std::getline(f, r)){
-                if(r.find(".so")!=std::string::npos) libs.insert(fs::path(r).filename().string());
-            }
-            for(auto& miss: missing){
-                for(auto& have: libs){
-                    if(have.rfind(miss,0)==0){
-                        std::cout<<"  - "<<e.path().stem().string()<<" (tem "<<have<<")\n";
-                    }
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-// sync (git) — commit/push de diretórios configurados
-static int action_sync(const std::string& scope, const std::optional<std::string>& message,
-                       const std::optional<std::string>& remoteOpt, const std::optional<std::string>& branchOpt,
-                       bool push, bool init_repo)
-{
-    fs::path root = CFG.home;
-    ensureDir(root);
-
-    if(init_repo){
-        if(!fileExists(root/".git")){
-            if(!runCommand("git -C '"+root.string()+"' init")){ logErr("git init falhou"); return 1; }
-        }
-        if(remoteOpt && !remoteOpt->empty()){
-            runCommand("git -C '"+root.string()+"' remote remove origin >/dev/null 2>&1 || true");
-            if(!runCommand("git -C '"+root.string()+"' remote add origin '"+*remoteOpt+"'")){ logErr("git remote add falhou"); return 1; }
-        } else if(!CFG.git_remote.empty()){
-            runCommand("git -C '"+root.string()+"' remote remove origin >/dev/null 2>&1 || true");
-            runCommand("git -C '"+root.string()+"' remote add origin '"+CFG.git_remote+"'");
-        }
-    }
-
-    if(!fileExists(root/".gitignore")){
-        std::ofstream gi(root/".gitignore");
-        gi << "# pkgmgr defaults\n*.tmp\n.cache/\n";
-    }
-
-    std::vector<fs::path> paths;
-    if(scope=="all"){ paths = {CFG.repo, CFG.logs, CFG.work, CFG.sources, CFG.bin, CFG.staging}; }
-    else if(scope=="repo"){ paths = {CFG.repo}; }
-    else if(scope=="logs"){ paths = {CFG.logs}; }
-    else if(scope=="packages"||scope=="pkgs"){ paths = {CFG.repo}; }
-    else if(scope=="work"){ paths = {CFG.work}; }
-    else if(scope=="sources"){ paths = {CFG.sources}; }
-    else { logWarn("Escopo desconhecido: "+scope+" — usando 'repo'"); paths = {CFG.repo}; }
-
-    for(const auto& p: paths){
-        if(!fileExists(p)) continue;
-        runCommand("git -C '"+root.string()+"' add -A '"+fs::relative(p, root).string()+"'");
-    }
-
-    std::string msg = message.value_or(("pkgmgr sync: " + now_ts("%Y-%m-%d %H:%M:%S")));
-    runCommand("bash -lc \"cd '"+root.string()+"' && git diff --cached --quiet || git commit -m '"+msg+"'\"");
-
-    std::string remote = remoteOpt.value_or(CFG.git_remote);
-    std::string branch = branchOpt.value_or(CFG.git_branch);
-    if(push){
-        if(remote.empty()){ logWarn("Remote não definido"); return 0; }
-        runCommand("bash -lc \"cd '"+root.string()+"' && git symbolic-ref -q HEAD || git checkout -b '"+branch+"'\"");
-        if(!runCommand("git -C '"+root.string()+"' push -u '"+remote+"' '"+branch+"'")){ logErr("git push falhou"); return 1; }
-        logInfo("Push realizado: " + remote + " " + branch);
-    }
-    return 0;
-}
-
-// instala com resolução de dependências
-static int action_install(const std::string& name){
-    // 1) carregar metas envolvidos
-    auto metas = collectMetas(name);
-    if(metas.count(name)==0){ logErr("Receita/metadata não encontrada para '"+name+"' em "+CFG.repo); return 1; }
-
-    // 2) ordenar topologicamente
-    auto order = topoSort(metas, name);
-    if(order.empty()) order.push_back(name); // fallback
-    logInfo("Ordem de instalação:");
-    for(auto& p: order) std::cerr<<" -> "<<p; std::cerr<<"\n";
-
-    // 3) para cada pacote: fetch (se source), extract, build, test, stage, package e instalar
-    for(const auto& p: order){
-        const auto& m = metas[p];
-
-        // fetch se URL/git referida em metadata
-        if(!m.source_url.empty()){
-            // nome do artefato
-            std::optional<std::string> sha;
-            if(!m.sha256.empty()) sha = m.sha256;
-            int frc = action_fetch(m.source_url, p, sha);
-            if(frc!=0) return frc;
-
-            // se baixou um arquivo (não git), tenta extrair para work
-            fs::path src = fs::path(CFG.sources) / (p);
-            // heurística: se é arquivo, extrai; se diretório, copia já foi feito.
-            if(fileExists(src) && fs::is_regular_file(src)){
-                if(action_extract(src.string(), p)!=0) return 1;
-            } else if(fileExists(src) && fs::is_directory(src)){
-                // copiar para work se work vazio
-                fs::path out = workDir(p);
-                if(!fileExists(out) || fs::is_empty(out)){
-                    ensureDir(out);
-                    runCommand("cp -a '"+src.string()+"'/* '"+out.string()+"/'");
-                }
-            }
-        }
-
-        // build+install esse pacote
-        int rc = action_install_one(p);
-        if(rc!=0) return rc;
-    }
-    return 0;
-}
-
-// ========================= Ajuda/uso =========================
+// ========================= Uso (CLI) =========================
 static void usage(){
     std::cout <<
 "mbuild — ferramenta de build/empacote para LFS (com resolução de dependências)\n\n"
@@ -846,7 +806,7 @@ static void usage(){
 "Git: remote="<<(CFG.git_remote.empty()?"<none>":CFG.git_remote)<<"  branch="<<CFG.git_branch<<"\n";
 }
 
-// ========================= Parser CLI =========================
+// ========================= Map Alias =========================
 static std::string mapAlias(const std::string& cmd){
     static const std::map<std::string,std::string> M = {
         {"0","help"}, {"h","help"}, {"help","help"},
@@ -870,135 +830,189 @@ static std::string mapAlias(const std::string& cmd){
     return it==M.end()? cmd : it->second;
 }
 
-// ========================= Main =========================
+// ========================= Main (CLI) =========================
 int main(int argc, char** argv){
-    // prepara diretórios base
-    ensureDir(CFG.home);
-    ensureDir(CFG.sources);
-    ensureDir(CFG.work);
-    ensureDir(CFG.logs);
-    ensureDir(CFG.repo);
-    ensureDir(CFG.bin);
-    ensureDir(CFG.staging);
+    // prepara diretórios básicos
+    ensuredir(CFG.sources);
+    ensuredir(CFG.work);
+    ensuredir(CFG.logs);
+    ensuredir(CFG.repo);
+    ensuredir(CFG.bin);
+    ensuredir(CFG.staging);
 
     db_load();
 
     std::vector<std::string> args(argv+1, argv+argc);
     if(args.empty()){ usage(); return 0; }
 
-    // flags globais (aceitas em qualquer posição)
+    // flags simples (algumas globais)
     auto eatFlag = [&](const std::string& f){
         auto it = std::find(args.begin(), args.end(), f);
         if(it!=args.end()){ args.erase(it); return true; } return false;
     };
-    auto getOpt = [&](const std::string& key)->std::optional<std::string>{
+    auto getOpt = [&](const std::string& key)->std::string{
         for(size_t i=0;i+1<args.size();++i){
             if(args[i]==key){
-                auto v=args[i+1];
+                std::string v=args[i+1];
                 args.erase(args.begin()+i, args.begin()+i+2);
                 return v;
             }
         }
-        return std::nullopt;
+        return "";
     };
 
-    // aplica globais relevantes
-    if(eatFlag("--no-strip")) G_DO_STRIP=false;
-    if(eatFlag("--strip"))    G_DO_STRIP=true;
-    if(eatFlag("--fakeroot")) G_USE_FAKEROOT=true;
-    if(auto f=getOpt("--strip-flags")) CFG.strip_flags=*f;
-    if(auto d=getOpt("--destdir"))     CFG.destdir=*d;
-    if(auto fmt=getOpt("--format"))    CFG.package_format=((*fmt=="zst")?"zst":"xz");
-    if(auto j=getOpt("--jobs"))        { try{ CFG.jobs = std::max(1, std::stoi(*j)); }catch(...){ } }
+    // aceitar alguns globais (simplesmente armazenamos)
+    if(eatFlag("--no-strip")) CFG.strip_flags = ""; // não usar -s
+    if(eatFlag("--strip")) if(CFG.strip_flags.empty()) CFG.strip_flags="-s";
+    std::string fmt = getOpt("--format"); if(!fmt.empty()) CFG.package_format=(fmt=="zst"?"zst":"xz");
+    std::string dest = getOpt("--destdir"); if(!dest.empty()) CFG.destdir=dest;
+    std::string jobsOpt = getOpt("--jobs"); if(!jobsOpt.empty()) try{ CFG.jobs=std::max(1, std::stoi(jobsOpt)); }catch(...){}
 
-    if(args.empty()){ usage(); return 0; }
     std::string cmd = mapAlias(args.front()); args.erase(args.begin());
-
     if(cmd=="help"){ usage(); return 0; }
 
     if(cmd=="fetch"){
-        if(args.empty()){ logErr("Uso: fetch <src> [--name N] [--sha256 SUM]"); return 2; }
+        if(args.empty()){ std::cerr<<"Uso: fetch <src> [--name N] [--sha256 SUM]\n"; return 2; }
         std::string src = args.front(); args.erase(args.begin());
-        auto name = getOpt("--name");
-        auto sha  = getOpt("--sha256");
-        return action_fetch(src, name, sha);
+        std::string name = getOpt("--name"); if(name.empty()) name = fs::path(src).filename().string();
+        std::string sha  = getOpt("--sha256");
+        bool ok = action_fetch(src, name, sha);
+        return ok?0:1;
     }
     if(cmd=="extract"){
-        if(args.empty()){ logErr("Uso: extract <arquivo|dir> [--name N]"); return 2; }
+        if(args.empty()){ std::cerr<<"Uso: extract <arquivo|dir> [--name N]\n"; return 2; }
         std::string in = args.front(); args.erase(args.begin());
-        auto name = getOpt("--name");
-        return action_extract(in, name);
+        std::string name = getOpt("--name"); if(name.empty()) name = fs::path(in).filename().string();
+        bool ok = action_extract(in, name);
+        return ok?0:1;
     }
     if(cmd=="build"){
-        if(args.empty()){ logErr("Uso: build <name> [--jobs N]"); return 2; }
+        if(args.empty()){ std::cerr<<"Uso: build <name> [--jobs N]\n"; return 2; }
         std::string name = args.front(); args.erase(args.begin());
-        if(auto j=getOpt("--jobs")){ try{ CFG.jobs = std::max(1, std::stoi(*j)); }catch(...){ } }
-        return action_build(name);
+        std::string j = getOpt("--jobs"); if(!j.empty()) try{ CFG.jobs=std::max(1, std::stoi(j)); }catch(...){}
+        bool ok = action_build(name, CFG.jobs);
+        return ok?0:1;
     }
     if(cmd=="test"){
-        if(args.empty()){ logErr("Uso: test <name>"); return 2; }
-        return action_test(args.front());
+        if(args.empty()){ std::cerr<<"Uso: test <name>\n"; return 2; }
+        bool ok = action_test(args.front());
+        return ok?0:1;
     }
     if(cmd=="install"){
-        if(args.empty()){ logErr("Uso: install <name> [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]"); return 2; }
+        if(args.empty()){ std::cerr<<"Uso: install <name> [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]\n"; return 2; }
         std::string name = args.front(); args.erase(args.begin());
-        // flags já capturadas globalmente
-        return action_install(name);
+        bool use_fakeroot = eatFlag("--fakeroot");
+        std::string sf = getOpt("--strip-flags"); if(!sf.empty()) CFG.strip_flags=sf;
+        std::string d = getOpt("--destdir"); if(!d.empty()) CFG.destdir=d;
+        std::string f = getOpt("--format"); if(!f.empty()) CFG.package_format=(f=="zst"?"zst":"xz");
+
+        // antes de instalar, tenta empacotar a partir do stage (opcional) → criar pacote final também
+        std::vector<std::string> staged;
+        std::string stageDir;
+        if(!stage_install(name, stageDir, staged)){
+            rollbackInstall(name);
+            return 1;
+        }
+        // conflitos
+        auto conflicts = detectConflicts(name, staged);
+        if(!conflicts.empty()){
+            std::ofstream lf(logPath(name,"install"), std::ios::app);
+            lf<<"[erro] Conflitos detectados:\n";
+            for(auto& c: conflicts) lf<<"  - "<<c<<"\n";
+            rollbackInstall(name);
+            return 1;
+        }
+        // instala no sistema
+        if(!installToSystem(stageDir, use_fakeroot, logPath(name,"install"))){
+            rollbackInstall(name);
+            return 1;
+        }
+        // grava .files
+        writeFilesList(name, staged);
+
+        // cria pacote (opcional útil)
+        std::string pkgfile;
+        if(!packStage(name, stageDir, pkgfile, logPath(name,"package"))){
+            std::cerr<<"[aviso] empacotamento falhou, seguindo.\n";
+        }
+
+        // Atualiza DBSTATE se existir metadado
+        // Aqui poderíamos carregar metadados de um arquivo META no work, mas como simplificação:
+        if(DBSTATE.installed.find(name)==DBSTATE.installed.end()){
+            PackageMeta m; m.name=name; m.version="unknown";
+            DBSTATE.installed[name] = m;
+            db_save();
+        }
+        return 0;
     }
     if(cmd=="package"){
-        if(args.empty()){ logErr("Uso: package <name> [--format zst|xz]"); return 2; }
+        if(args.empty()){ std::cerr<<"Uso: package <name> [--format zst|xz]\n"; return 2; }
         std::string name = args.front(); args.erase(args.begin());
-        return action_package(name);
+        std::string f = getOpt("--format"); if(!f.empty()) CFG.package_format=(f=="zst"?"zst":"xz");
+        bool ok = action_package(name);
+        return ok?0:1;
     }
     if(cmd=="remove"){
-        if(args.empty()){ logErr("Uso: remove <name>"); return 2; }
-        return action_remove(args.front());
+        if(args.empty()){ std::cerr<<"Uso: remove <name>\n"; return 2; }
+        return action_remove(args.front())?0:1;
     }
     if(cmd=="upgrade"){
-        if(args.empty()){ logErr("Uso: upgrade <name>"); return 2; }
-        return action_upgrade(args.front());
+        if(args.empty()){ std::cerr<<"Uso: upgrade <name>\n"; return 2; }
+        bool use_fakeroot = eatFlag("--fakeroot");
+        return action_upgrade(args.front(), use_fakeroot)?0:1;
     }
     if(cmd=="reinstall"){
-        if(args.empty()){ logErr("Uso: reinstall <name>"); return 2; }
-        return action_reinstall(args.front());
+        if(args.empty()){ std::cerr<<"Uso: reinstall <name>\n"; return 2; }
+        bool use_fakeroot = eatFlag("--fakeroot");
+        return action_reinstall(args.front(), use_fakeroot)?0:1;
     }
     if(cmd=="clean"){
-        if(args.empty()){ logErr("Uso: clean <name>"); return 2; }
-        return action_clean(args.front());
-    }
-    if(cmd=="info"){
-        if(args.empty()){ logErr("Uso: info <name>"); return 2; }
-        return action_info(args.front());
-    }
-    if(cmd=="search"){
-        if(args.empty()){ logErr("Uso: search <termo>"); return 2; }
-        return action_search(args.front());
+        if(args.empty()){ std::cerr<<"Uso: clean <name>\n"; return 2; }
+        std::string name = args.front();
+        std::error_code ec;
+        fs::remove_all(pjoin(CFG.work,name), ec);
+        fs::remove_all(pjoin(CFG.logs,name), ec);
+        fs::remove_all(pjoin(CFG.staging,name), ec);
+        std::cout<<"Clean concluído: "<<name<<"\n";
+        return 0;
     }
     if(cmd=="verify"){
-        if(args.size()<2){ logErr("Uso: verify <arquivo> --sha256 SUM"); return 2; }
+        if(args.size()<2){ std::cerr<<"Uso: verify <arquivo> --sha256 SUM\n"; return 2; }
         std::string file = args.front(); args.erase(args.begin());
-        auto sum = getOpt("--sha256");
-        if(!sum){ logErr("--sha256 obrigatório"); return 2; }
-        return action_verify(file, *sum);
+        std::string sha = getOpt("--sha256");
+        if(sha.empty()){ std::cerr<<"--sha256 obrigatório\n"; return 2; }
+        return action_verify(file, sha)?0:1;
+    }
+    if(cmd=="info"){
+        if(args.empty()){ std::cerr<<"Uso: info <name>\n"; return 2; }
+        action_info(args.front());
+        return 0;
+    }
+    if(cmd=="search"){
+        if(args.empty()){ std::cerr<<"Uso: search <termo>\n"; return 2; }
+        action_search(args.front());
+        return 0;
     }
     if(cmd=="revdep"){
-        if(args.empty()){ logErr("Uso: revdep <name>"); return 2; }
-        return action_revdep(args.front());
+        if(args.empty()){ std::cerr<<"Uso: revdep <name>\n"; return 2; }
+        action_revdep(args.front());
+        return 0;
     }
     if(cmd=="sync"){
         std::string scope = "repo";
-        if(!args.empty() && args.front().rfind("-",0)!=0){ scope = args.front(); args.erase(args.begin()); }
-        auto msg = getOpt("--message");
-        auto rem = getOpt("--remote");
-        auto br  = getOpt("--branch");
+        if(!args.empty() && args.front().rfind("-",0)!=0){ scope=args.front(); args.erase(args.begin()); }
+        std::string msg = getOpt("--message");
+        std::string rem = getOpt("--remote");
+        std::string br  = getOpt("--branch");
         bool push = true;
         if(eatFlag("--no-push")) push=false;
         if(eatFlag("--push")) push=true;
         bool init_repo = eatFlag("--init");
-        return action_sync(scope, msg, rem, br, push, init_repo);
+        bool ok = action_sync(scope, msg, rem, br, push, init_repo);
+        return ok?0:1;
     }
 
-    logErr("Comando desconhecido: " + cmd);
+    std::cerr<<"Comando desconhecido.\n";
     usage();
     return 2;
 }
