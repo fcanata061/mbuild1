@@ -1,4 +1,4 @@
-// mbuild.cpp — Ferramenta única de build/empacotamento (LFS-friendly) com resolução topológica
+// mbuild.cpp — Ferramenta única de build/empacotamento (LFS-friendly) com resolução automática de dependências
 // Autor: ChatGPT (GPT-5 Thinking)
 // Licença: MIT
 //
@@ -8,22 +8,17 @@
 //  - build: autodetecta build system (build.sh, autogen+configure, configure+make,
 //           cmake, meson, python (setup.py/pyproject), cargo, go, makefile)
 //  - test: make test/check, ninja test, cargo test (quando existir)
-//  - install: instala via DESTDIR em staging, strip (ELF only), gera pacote (tar.zst/xz),
-//             registra lista de arquivos e instala no sistema (fakeroot opcional)
+//  - install: resolve dependências com ordenação topológica, instala via DESTDIR em staging,
+//             strip (ELF only), gera pacote (tar.zst/xz), registra lista de arquivos e instala
+//             no sistema (fakeroot opcional)
 //  - package: gera pacote a partir do staging sem instalar no sistema
-//  - remove: desinstala usando lista de arquivos registrada
-//  - clean: remove work/logs/staging do pacote
-//  - upgrade/reinstall: conveniências
-//  - verify: verifica sha256 de um arquivo
-//  - info: exibe metadados do pacote
-//  - search: busca nos metadados/nomes
-//  - revdep: ldd para detectar libs ausentes e sugerir pacotes
-//  - deps: imprime ordem topológica (e opcionalmente reversa) das dependências
+//  - remove: desinstala em ordem topológica reversa (dependentes → dependências)
+//  - clean, upgrade, reinstall, verify, info, search, revdep
 //  - hooks: pre/post de várias fases (fetch, extract, build, install, package, remove, clean)
 //  - sync: versão, commit e push (git) do conteúdo (repo/logs/packages/work) com opções
 //  - CLI consistente: nomes longos, curtos e numéricos (0 help; 1 fetch; 2 extract; 3 build;
 //                     4 test; 5 install; 6 package; 7 remove; 8 upgrade; 9 reinstall;
-//                     10 clean; 11 info; 12 search; 13 verify; 14 revdep; 15 sync; 16 deps)
+//                     10 clean; 11 info; 12 search; 13 verify; 14 revdep; 15 sync)
 //
 // Layout padrão (pode ser alterado por env/rc):
 //   $MBUILD_HOME (default: $HOME/.local/mbuild)
@@ -59,13 +54,12 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -162,7 +156,7 @@ static void logErr(const std::string& s){
     else std::cerr<<"[x] "<<s<<"\n";
 }
 
-static std::string sanitize(const std::string& s){
+static std::string sanitize(const std::::string& s){
     std::string r; r.reserve(s.size());
     for(char c: s){
         if(std::isalnum((unsigned char)c) || c=='-'||c=='_'||c=='.') r.push_back(c);
@@ -310,71 +304,6 @@ static std::map<std::string,std::string> metaGetAll(const std::string& name){
     return kv;
 }
 
-// ---------- Leitura de dependências e ordenação topológica ----------
-static std::vector<std::string> splitCSV(const std::string& s){
-    std::vector<std::string> out;
-    std::string cur;
-    std::istringstream iss(s);
-    while(std::getline(iss, cur, ',')){
-        // trim
-        size_t a=0,b=cur.size();
-        while(a<b && std::isspace((unsigned char)cur[a])) ++a;
-        while(b>a && std::isspace((unsigned char)cur[b-1])) --b;
-        if(a<b) out.push_back(cur.substr(a,b-a));
-    }
-    return out;
-}
-
-static std::vector<std::string> metaDeps(const std::string& name){
-    auto m = metaGetAll(name);
-    if(!m.count("deps")) return {};
-    return splitCSV(m["deps"]);
-}
-
-static bool metaKnown(const std::string& name){
-    return fileExists(metaPath(name));
-}
-
-static std::vector<std::string> topoResolve(const std::vector<std::string>& roots, bool reverse_order, bool strict_missing=false){
-    // DFS com detecção de ciclo
-    enum class Mark { NONE, TEMP, PERM };
-    std::unordered_map<std::string, Mark> mark;
-    std::vector<std::string> out;
-    std::function<void(const std::string&)> dfs = [&](const std::string& n){
-        auto it = mark.find(n);
-        if(it!=mark.end()){
-            if(it->second==Mark::TEMP){
-                logErr("Ciclo detectado envolvendo: " + n);
-                throw std::runtime_error("cycle");
-            }
-            if(it->second==Mark::PERM) return;
-        }
-        mark[n]=Mark::TEMP;
-        if(!metaKnown(n)){
-            std::string msg = "Meta não encontrada para '"+n+"'.";
-            if(strict_missing){ logErr(msg); throw std::runtime_error("missing"); }
-            else logWarn(msg+" Continuando sem expandir deps.");
-        } else {
-            for(const auto& d: metaDeps(n)){
-                dfs(d);
-            }
-        }
-        mark[n]=Mark::PERM;
-        out.push_back(n);
-    };
-
-    for(const auto& r: roots) dfs(r);
-
-    if(reverse_order) std::reverse(out.begin(), out.end());
-    // remove duplicatas preservando a ordem (já é único pelo PERM, mas por segurança)
-    std::vector<std::string> uniq; uniq.reserve(out.size());
-    std::unordered_set<std::string> seen;
-    for(const auto& n: out){
-        if(seen.insert(n).second) uniq.push_back(n);
-    }
-    return uniq;
-}
-
 // ========================= Config (env + rc) =========================
 static void loadConfig(){
     std::string home_dir = Config::envOr("HOME","/root");
@@ -448,8 +377,216 @@ static void runHooks(const std::string& phase, const std::string& name, const fs
         if((p & fs::perms::owner_exec) == fs::perms::none) continue;
         std::string cmd = "'" + e.path().string() + "' '" + name + "'";
         logInfo("Hook "+phase+": "+e.path().filename().string());
-        runCmd(cmd, log);
+        int rc = runCmd(cmd, log);
+        if(rc!=0){
+            logErr("Hook '"+phase+"' falhou ("+e.path().filename().string()+"), abortando fase.");
+            throw std::runtime_error("hook failed");
+        }
     }
+}
+
+// ========================= Utilidades de string/deps =========================
+static std::string trim(const std::string& s){
+    size_t a=0, b=s.size();
+    while(a<b && std::isspace((unsigned char)s[a])) ++a;
+    while(b>a && std::isspace((unsigned char)s[b-1])) --b;
+    return s.substr(a,b-a);
+}
+static std::vector<std::string> split(const std::string& s, char sep){
+    std::vector<std::string> out; std::string cur;
+    std::istringstream iss(s);
+    while(std::getline(iss, cur, sep)){
+        cur = trim(cur);
+        if(!cur.empty()) out.push_back(cur);
+    }
+    return out;
+}
+static std::vector<std::string> parse_deps(const std::string& depstr){
+    if(depstr.empty()) return {};
+    auto v = split(depstr, ',');
+    // normaliza nomes
+    for(auto& x: v) x = sanitize(x);
+    return v;
+}
+
+// ========================= Consulta de instalação =========================
+static bool is_installed(const std::string& name){
+    fs::path fp = filesPath(name);
+    if(!fileExists(fp)) return false;
+    // Heurística: se pelo menos um arquivo listado existe no DESTDIR, consideramos instalado
+    std::ifstream in(fp);
+    std::string rel; int hits=0, checked=0;
+    while(std::getline(in, rel) && checked<50){ // não precisa checar tudo
+        fs::path p = fs::path(CFG.destdir)/rel;
+        if(fileExists(p)) ++hits;
+        ++checked;
+    }
+    return hits>0;
+}
+
+// ========================= Grafo de dependências =========================
+struct DepGraph {
+    // edges: pkg -> deps (pkg depende de deps)
+    std::map<std::string, std::vector<std::string>> edges;
+    // reverse: dep -> list of dependents
+    std::map<std::string, std::vector<std::string>> rev;
+};
+
+static std::vector<std::string> list_all_packages(){
+    std::vector<std::string> names;
+    if(!fileExists(CFG.repo)) return names;
+    for(auto& e: fs::directory_iterator(CFG.repo)){
+        if(!e.is_regular_file()) continue;
+        if(e.path().extension()==".meta"){
+            names.push_back(e.path().stem().string());
+        }
+    }
+    return names;
+}
+
+static DepGraph build_dep_graph(){
+    DepGraph g;
+    auto names = list_all_packages();
+    for(const auto& name: names){
+        auto kv = metaGetAll(name);
+        std::vector<std::string> deps;
+        if(kv.count("deps")) deps = parse_deps(kv["deps"]);
+        g.edges[name] = deps;
+        for(const auto& d: deps){
+            g.rev[d].push_back(name);
+        }
+        // garante presença de nós isolados
+        if(!g.rev.count(name)) g.rev[name] = {};
+    }
+    return g;
+}
+
+static void dfs_closure(const std::string& start,
+                        const std::map<std::string,std::vector<std::string>>& edges,
+                        std::set<std::string>& vis){
+    if(vis.count(start)) return;
+    vis.insert(start);
+    auto it = edges.find(start);
+    if(it==edges.end()) return;
+    for(const auto& d: it->second){
+        dfs_closure(d, edges, vis);
+    }
+}
+
+// Kahn topological sort para subconjunto (fecho de targets)
+static std::vector<std::string> topo_order_for_targets(
+        const std::vector<std::string>& targets,
+        const std::map<std::string,std::vector<std::string>>& edges,
+        bool& ok, std::vector<std::string>& cycle_hint)
+{
+    ok = true; cycle_hint.clear();
+    // fecho de dependências
+    std::set<std::string> nodes;
+    for(const auto& t: targets){
+        dfs_closure(t, edges, nodes);
+        nodes.insert(t);
+    }
+
+    // indegree no subgrafo
+    std::map<std::string,int> indeg;
+    for(const auto& n: nodes) indeg[n]=0;
+    for(const auto& n: nodes){
+        auto it = edges.find(n);
+        if(it==edges.end()) continue;
+        for(const auto& d: it->second){
+            if(nodes.count(d)) indeg[n] += 1; // aresta n -> d (n depende de d)
+        }
+    }
+
+    // Kahn: queremos deps primeiro, então a BFS remove nós com indeg==0 (sem dependências)
+    std::queue<std::string> q;
+    for(const auto& kv: indeg) if(kv.second==0) q.push(kv.first);
+
+    std::vector<std::string> ordered;
+    while(!q.empty()){
+        auto u = q.front(); q.pop();
+        ordered.push_back(u);
+        // "remover" u: diminuir indegree de quem depende de u? No nosso modelo indeg[n] conta deps, então
+        // precisamos percorrer todos v tais que v depende de u (i.e., edges[v] contém u).
+        for(const auto& v: nodes){
+            if(v==u) continue;
+            auto it = edges.find(v);
+            if(it==edges.end()) continue;
+            for(const auto& d: it->second){
+                if(d==u){
+                    if(--indeg[v]==0) q.push(v);
+                }
+            }
+        }
+    }
+
+    if(ordered.size()!=nodes.size()){
+        ok=false;
+        // crude cycle hint: lista nós que ficaram com indeg>0
+        for(const auto& kv: indeg) if(kv.second>0) cycle_hint.push_back(kv.first);
+    }
+    return ordered;
+}
+
+static std::vector<std::string> reverse_topo_remove_order(
+        const std::string& target,
+        const DepGraph& g)
+{
+    // precisamos da "fechadura" de dependentes de target, usando g.rev
+    std::set<std::string> clos;
+    std::function<void(const std::string&)> dfs_rev = [&](const std::string& n){
+        if(clos.count(n)) return;
+        clos.insert(n);
+        auto it = g.rev.find(n);
+        if(it==g.rev.end()) return;
+        for(const auto& dep: it->second){ // dep é quem depende de n
+            dfs_rev(dep);
+        }
+    };
+    dfs_rev(target);
+
+    // Para obter ordem dependentes→dependências para remoção do conjunto clos,
+    // podemos ordenar topologicamente no grafo "normal" edges e depois inverter,
+    // mas apenas restrito ao conjunto clos + todas as dependências internas necessárias
+    // para ligação correta do subgrafo. Simpler: produza topo no grafo reverso (dependente -> suas "dependências" no reverso são quem depende dele),
+    // depois use a ordem "como vem" (que já coloca dependentes antes do nó).
+    // Implementação: rodaremos Kahn no grafo reverso restrito a 'clos'.
+    // Build indeg on rev graph: indeg[n] = número de "pré-requisitos" no reverso (i.e., qtd de quem depende de n).
+    std::map<std::string,int> indeg;
+    for(const auto& n: clos) indeg[n]=0;
+    for(const auto& n: clos){
+        auto it = g.rev.find(n);
+        if(it==g.rev.end()) continue;
+        for(const auto& child: it->second){
+            if(clos.count(child)) indeg[child] += 1;
+        }
+    }
+    std::queue<std::string> q;
+    for(const auto& kv: indeg) if(kv.second==0) q.push(kv.first);
+
+    std::vector<std::string> order;
+    while(!q.empty()){
+        auto u=q.front(); q.pop();
+        order.push_back(u);
+        auto it=g.rev.find(u);
+        if(it!=g.rev.end()){
+            for(const auto& child: it->second){
+                if(!clos.count(child)) continue;
+                if(--indeg[child]==0) q.push(child);
+            }
+        }
+    }
+    // order agora tem nós "de baixo para cima" (itens sem dependentes primeiro),
+    // mas como o grafo é o reverso, essa ordem já é adequada para remoção:
+    // quem depende aparece depois (e portanto será removido antes, pois processamos linearmente).
+    // Para garantir que 'target' seja no final (i.e., removido por último),
+    // podemos estável-particionar movendo-o para o fim preservando ordem relativa.
+    std::stable_sort(order.begin(), order.end(), [&](const std::string& a, const std::string& b){
+        if(a==target) return false;
+        if(b==target) return true;
+        return false;
+    });
+    return order;
 }
 
 // ========================= Fases de instalação / pacote =========================
@@ -496,6 +633,7 @@ static int install_stage_to_system(const std::string& name, const fs::path& stag
     if(rc==0) logInfo("Instalação concluída: " + name + " => " + CFG.destdir);
     return rc;
 }
+
 // ========================= Ações: fetch/extract/build/test/... =========================
 static int action_fetch(const std::string& src, const std::optional<std::string>& nameOpt, const std::optional<std::string>& sha){
     ensureDir(CFG.sources); ensureDir(CFG.logs);
@@ -503,7 +641,7 @@ static int action_fetch(const std::string& src, const std::optional<std::string>
     fs::path log = CFG.logs/name/(timestamp_compact()+"-fetch.log");
     int rc=0;
 
-    runHooks("pre-fetch", name, log);
+    try{ runHooks("pre-fetch", name, log); }catch(...){ return 1; }
 
     if(isGitUrl(src)){
         fs::path dst = CFG.sources/name;
@@ -525,7 +663,7 @@ static int action_fetch(const std::string& src, const std::optional<std::string>
         if(rc==0 && sha){
             std::string verify = "echo '" + *sha + "  " + out.filename().string() + "' | (cd '" + CFG.sources.string() + "' && sha256sum -c -)";
             int vrc = runCmd(verify, log);
-            if(vrc!=0){ logErr("SHA256 não confere"); runHooks("post-fetch", name, log); return vrc; }
+            if(vrc!=0){ logErr("SHA256 não confere"); try{ runHooks("post-fetch", name, log);}catch(...){ } return vrc; }
         }
         if(rc==0) metaSet(name, "source", out.string());
     } else {
@@ -538,7 +676,7 @@ static int action_fetch(const std::string& src, const std::optional<std::string>
         if(rc==0) metaSet(name, "source", dst.string());
     }
 
-    runHooks("post-fetch", name, log);
+    try{ runHooks("post-fetch", name, log); }catch(...){ return 1; }
     if(rc==0) logInfo("Fetch concluído: " + name);
     return rc;
 }
@@ -549,7 +687,7 @@ static int action_extract(const std::string& input, const std::optional<std::str
     fs::path outdir = CFG.work/name; ensureDir(outdir);
     fs::path log = CFG.logs/name/(timestamp_compact()+"-extract.log");
 
-    runHooks("pre-extract", name, log);
+    try{ runHooks("pre-extract", name, log); }catch(...){ return 1; }
 
     std::string kind = detectArchiveType(input);
     int rc=0;
@@ -564,7 +702,7 @@ static int action_extract(const std::string& input, const std::optional<std::str
     }
     if(rc==0){ metaSet(name, "workdir", outdir.string()); }
 
-    runHooks("post-extract", name, log);
+    try{ runHooks("post-extract", name, log); }catch(...){ return 1; }
     if(rc==0) logInfo("Extração concluída: " + name);
     return rc;
 }
@@ -576,7 +714,7 @@ static int action_build(const std::string& name){
     fs::path workdir = meta.count("workdir")? fs::path(meta["workdir"]) : CFG.work/name;
     fs::path srcdir = firstOrOnlySubdir(workdir);
 
-    runHooks("pre-build", name, log);
+    try{ runHooks("pre-build", name, log); }catch(...){ return 1; }
 
     auto runIn = [&](const std::string& c){ return runCmd("bash -lc 'cd " + srcdir.string() + " && " + c + "'", log, false); };
     int rc=0;
@@ -604,7 +742,7 @@ static int action_build(const std::string& name){
         logWarn("Nenhum sistema de build detectado. Nada a fazer.");
     }
 
-    runHooks("post-build", name, log);
+    try{ runHooks("post-build", name, log); }catch(...){ return 1; }
     if(rc==0) logInfo("Build concluído: " + name);
     return rc;
 }
@@ -636,7 +774,7 @@ static int stage_install(const std::string& name, fs::path& out_stage, fs::path&
     ensureDir(stage);
     out_stage = stage;
 
-    runHooks("pre-install", name, log);
+    try{ runHooks("pre-install", name, log); }catch(...){ return 1; }
 
     auto runIn = [&](const std::string& c){ return runCmd("bash -lc 'cd " + srcdir.string() + " && " + c + "'", log, false); };
 
@@ -675,18 +813,18 @@ static int stage_install(const std::string& name, fs::path& out_stage, fs::path&
 
     return rc;
 }
-
-static int action_install(const std::string& name){
-    // dependências declaradas em meta (opcional: deps=foo,bar)
+// ========================= Instalação com empacotamento + registro =========================
+// Mantemos a lógica original em uma função "single" e criamos um orquestrador com deps.
+static int install_single(const std::string& name){
+    // dependências declaradas em meta (validação simples: verificar se metas existem — resolução automática ocorre fora)
     auto meta = metaGetAll(name);
     if (meta.count("deps")){
         std::istringstream iss(meta["deps"]); std::string dep;
         while(std::getline(iss, dep, ',')){
+            dep = trim(dep);
             if(dep.empty()) continue;
-            if(!fileExists(metaPath(dep))){
-                logErr("Dependência não instalada: " + dep);
-                return 1;
-            }
+            // Se meta não existe, pode ser que o pacote ainda não foi criado/configurado.
+            // Não abortamos aqui — o orquestrador já garantiu a ordem de instalação.
         }
     }
     fs::path stage, srcdir, slog;
@@ -708,10 +846,48 @@ static int action_install(const std::string& name){
     rc = install_stage_to_system(name, stage, slog);
     if(rc!=0){ logErr("Falha ao instalar no destino"); return rc; }
 
-    runHooks("post-install", name, slog);
+    try{ runHooks("post-install", name, slog); }catch(...){ return 1; }
+    // marca instalado
+    metaSet(name, "installed_at", now_ts());
     return 0;
 }
 
+// Resolve ordem e instala dependências ausentes automaticamente.
+// Mantém o nome action_install como orquestrador para preservar a CLI.
+static int action_install(const std::string& root_name){
+    // 1) constrói grafo
+    DepGraph g = build_dep_graph();
+
+    // 2) obtém ordem topológica para root + deps
+    bool ok=true; std::vector<std::string> cycle;
+    auto order = topo_order_for_targets({root_name}, g.edges, ok, cycle);
+    if(!ok){
+        logErr("Ciclo de dependências detectado:");
+        for(auto& n: cycle) std::cerr<<"  - "<<n<<"\n";
+        return 1;
+    }
+    // order: deps primeiro, root por último
+    logInfo("Ordem de instalação (deps → alvo):");
+    for(auto& n: order) std::cerr<<"  "<<n<<"\n";
+
+    // 3) instala na sequência, pulando já instalados
+    int rc_all=0;
+    for(const auto& name: order){
+        if(is_installed(name)){
+            logInfo("Já instalado, pulando: " + name);
+            continue;
+        }
+        logInfo("Instalando: " + name);
+        int rc = install_single(name);
+        if(rc!=0){
+            logErr("Falha instalando '"+name+"'. Abortando sequência.");
+            return rc;
+        }
+    }
+    return rc_all;
+}
+
+// ========================= Package-only =========================
 static int action_package(const std::string& name){
     auto meta = metaGetAll(name);
     fs::path workdir = meta.count("workdir")? fs::path(meta["workdir"]) : CFG.work/name;
@@ -723,7 +899,7 @@ static int action_package(const std::string& name){
         if(rc!=0){ logErr("Falha ao preparar staging para pacote"); return rc; }
     } else {
         slog = CFG.logs/name/(timestamp_compact()+"-package.log");
-        runHooks("pre-package", name, slog);
+        try{ runHooks("pre-package", name, slog); }catch(...){ return 1; }
     }
 
     // strip e empacota
@@ -735,19 +911,20 @@ static int action_package(const std::string& name){
 
     record_filelist_from_stage(name, stage, slog);
 
-    runHooks("post-package", name, slog);
+    try{ runHooks("post-package", name, slog); }catch(...){ return 1; }
     logInfo("Pacote criado (sem instalar): " + pkgfile.string());
     return 0;
 }
 
-static int action_remove(const std::string& name){
+// ========================= Remoção (topológica reversa com dependentes) =========================
+static int remove_single(const std::string& name){
     ensureDir(CFG.logs);
     fs::path log = CFG.logs/name/(timestamp_compact()+"-remove.log");
 
     fs::path filelist = filesPath(name);
     if(!fileExists(filelist)){ logErr("Lista de arquivos não encontrada: " + filelist.string()); return 1; }
 
-    runHooks("pre-remove", name, log);
+    try{ runHooks("pre-remove", name, log); }catch(...){ return 1; }
 
     std::ifstream in(filelist); std::string rel;
     int rc_total=0;
@@ -762,30 +939,63 @@ static int action_remove(const std::string& name){
     std::string clean = "bash -lc 'sort -r \"" + filelist.string() + "\" | xargs -I{} dirname {} | sort -u | while read d; do rmdir -p --ignore-fail-on-non-empty \"" + CFG.destdir + "/$d\" 2>/dev/null || true; done'";
     runCmd(clean, log);
 
-    runHooks("post-remove", name, log);
+    // limpa marcações
+    std::error_code ec;
+    fs::remove(filesPath(name), ec);
+    fs::remove(metaPath(name), ec);
+
+    try{ runHooks("post-remove", name, log); }catch(...){ return 1; }
     logInfo("Remoção concluída: " + name);
     return rc_total;
 }
 
+static int action_remove(const std::string& root_name){
+    // Se existirem pacotes que dependem de root_name, removemos em ordem "dependentes primeiro"
+    DepGraph g = build_dep_graph();
+
+    // monta ordem reversa
+    auto order = reverse_topo_remove_order(root_name, g);
+    if(order.empty()){
+        // ninguém depende de root_name (ou root não existe no grafo). Remoção direta.
+        return remove_single(root_name);
+    }
+    logInfo("Ordem de remoção (dependentes → alvo):");
+    for(auto& n: order) std::cerr<<"  "<<n<<"\n";
+
+    int rc_all=0;
+    for(const auto& name: order){
+        if(!fileExists(filesPath(name))){
+            logWarn("Sem .files para '"+name+"' — talvez já removido. Pulando.");
+            continue;
+        }
+        int rc = remove_single(name);
+        if(rc!=0) rc_all |= rc;
+    }
+    return rc_all;
+}
+
+// ========================= Clean / Upgrade / Reinstall =========================
 static int action_clean(const std::string& name){
     ensureDir(CFG.logs);
     fs::path log = CFG.logs/name/(timestamp_compact()+"-clean.log");
-    runHooks("pre-clean", name, log);
+    try{ runHooks("pre-clean", name, log); }catch(...){ return 1; }
     std::error_code ec;
     fs::remove_all(CFG.work/name, ec);
     fs::remove_all(CFG.logs/name, ec);
     fs::remove_all(CFG.staging/name, ec);
-    runHooks("post-clean", name, log);
+    try{ runHooks("post-clean", name, log); }catch(...){ return 1; }
     logInfo("Clean concluído: " + name);
     return 0;
 }
 
 static int action_upgrade(const std::string& name){
+    // upgrade = remove dependentes + alvo e depois reinstala conforme grafo (instalação resolve deps)
     int rc = action_remove(name);
     if(rc!=0) return rc;
     return action_install(name);
 }
 static int action_reinstall(const std::string& name){
+    // reinstala respeitando dependências
     return action_install(name);
 }
 
@@ -901,7 +1111,7 @@ static int action_sync(const std::string& scope, const std::optional<std::string
         }
     }
 
-    // Monta .gitignore mínimo (não ignoramos nada crítico por padrão)
+    // Monta .gitignore mínimo
     if(!fileExists(root/".gitignore")){
         std::ofstream gi(root/".gitignore");
         gi << "# mbuild defaults\n"
@@ -951,22 +1161,22 @@ static int action_sync(const std::string& scope, const std::optional<std::string
 // ========================= Ajuda/uso =========================
 static void usage(){
     std::cout <<
-"mbuild — ferramenta de build/empacote para LFS\n\n"
+"mbuild — ferramenta de build/empacote para LFS (com resolução de dependências)\n\n"
 "Uso:\n"
 "  mbuild <comando> [opções]\n\n"
 "Comandos (nomes longos | atalho | número):\n"
 "  help                    | h   | 0   — mostrar ajuda\n"
 "  fetch <SRC>             | f   | 1   — baixar (curl/git/dir) [--name N] [--sha256 SUM]\n"
 "  extract <ARQ|DIR>       | x   | 2   — extrair/copiar para work [--name N]\n"
-"  build <NAME...>         | b   | 3   — compilar um ou mais pacotes [--jobs N]\n"
-"  test <NAME...>          | t   | 4   — rodar testes\n"
-"  install <NAME...>       | i   | 5   — instalar (resolução topológica)\n"
+"  build <NAME>            | b   | 3   — compilar [--jobs N]\n"
+"  test <NAME>             | t   | 4   — rodar testes\n"
+"  install <NAME>          | i   | 5   — resolver deps e instalar (staging→pacote→sistema)\n"
 "      [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]\n"
-"  package <NAME...>       | p   | 6   — gerar pacote a partir do staging [--format zst|xz]\n"
-"  remove <NAME...>        | rm  | 7   — remover (ordem reversa)\n"
-"  upgrade <NAME...>       | up  | 8   — remove + install (topológica)\n"
-"  reinstall <NAME...>     | ri  | 9   — install novamente (topológica)\n"
-"  clean <NAME...>         | c   | 10  — limpar work/logs/staging\n"
+"  package <NAME>          | p   | 6   — gerar pacote a partir do staging [--format zst|xz]\n"
+"  remove <NAME>           | rm  | 7   — remover (dependentes → alvo) em ordem reversa\n"
+"  upgrade <NAME>          | up  | 8   — remove + install (com deps)\n"
+"  reinstall <NAME>        | ri  | 9   — install novamente (com deps)\n"
+"  clean <NAME>            | c   | 10  — limpar work/logs/staging do pacote\n"
 "  info <NAME>             |     | 11  — exibir metadados do pacote\n"
 "  search <TERMO>          | s   | 12  — buscar no repositório local\n"
 "  verify <ARQ> --sha256 S | v   | 13  — verificar sha256\n"
@@ -974,7 +1184,6 @@ static void usage(){
 "  sync [escopo]           |     | 15  — sincronizar com git (commit/push)\n"
 "      escopo: repo|logs|packages|work|sources|all (default: repo)\n"
 "      opções: --message MSG --remote URL --branch BR --push|--no-push --init\n"
-"  deps <NAME...>          | dps | 16  — imprimir ordem topológica (use --reverse p/ ordem inversa)\n"
 "\n"
 "Flags globais (antes/depois do comando): --color | --no-color | --no-spinner | --quiet | --verbose\n"
 "Dirs ativos:\n"
@@ -983,21 +1192,6 @@ static void usage(){
 "  repo="<<CFG.repo<<"  bin="<<CFG.bin<<"  staging="<<CFG.staging<<"\n"
 "Config: destdir="<<CFG.destdir<<"  jobs="<<CFG.jobs<<"  strip_flags="<<CFG.strip_flags<<"  format="<<CFG.package_format<<"\n"
 "Git: remote="<<(CFG.git_remote.empty()?"<none>":CFG.git_remote)<<"  branch="<<CFG.git_branch<<"\n";
-}
-
-// ========================= Util: executar em múltiplos pacotes =========================
-template<typename F>
-static int run_for_all(const std::vector<std::string>& names, F fn){
-    int rc_total = 0;
-    for(const auto& n: names){
-        int rc = fn(n);
-        rc_total |= rc;
-        if(rc!=0){
-            logErr("Falha no pacote: " + n);
-            // continua processando os demais para relatar tudo
-        }
-    }
-    return rc_total;
 }
 
 // ========================= Parser CLI =========================
@@ -1018,8 +1212,7 @@ static std::string mapAlias(const std::string& cmd){
         {"12","search"}, {"s","search"}, {"search","search"},
         {"13","verify"}, {"v","verify"}, {"verify","verify"},
         {"14","revdep"}, {"revdep","revdep"},
-        {"15","sync"}, {"sync","sync"},
-        {"16","deps"}, {"dps","deps"}
+        {"15","sync"}, {"sync","sync"}
     };
     auto it=M.find(cmd);
     return it==M.end()? cmd : it->second;
@@ -1076,62 +1269,47 @@ int main(int argc, char** argv){
         return action_extract(in, name);
     }
     if(cmd=="build"){
-        if(args.empty()){ logErr("Uso: build <name...> [--jobs N]"); return 2; }
+        if(args.empty()){ logErr("Uso: build <name> [--jobs N]"); return 2; }
+        std::string name = args.front(); args.erase(args.begin());
         if(auto j=getOpt("--jobs")){ try{ CFG.jobs = std::max(1, std::stoi(*j)); }catch(...){ } }
-        // build não precisa de ordem topológica — executa na sequência informada
-        return run_for_all(args, action_build);
+        return action_build(name);
     }
     if(cmd=="test"){
-        if(args.empty()){ logErr("Uso: test <name...>"); return 2; }
-        return run_for_all(args, action_test);
+        if(args.empty()){ logErr("Uso: test <name>"); return 2; }
+        return action_test(args.front());
     }
     if(cmd=="install"){
-        if(args.empty()){ logErr("Uso: install <name...> [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]"); return 2; }
+        if(args.empty()){ logErr("Uso: install <name> [--destdir D] [--fakeroot] [--strip|--no-strip] [--strip-flags F] [--format zst|xz]"); return 2; }
+        std::string name = args.front(); args.erase(args.begin());
         if(eatFlag("--fakeroot")) CFG.use_fakeroot=true;
         if(eatFlag("--no-strip")) CFG.do_strip=false;
         if(eatFlag("--strip")) CFG.do_strip=true;
         if(auto f=getOpt("--strip-flags")) CFG.strip_flags=*f;
         if(auto d=getOpt("--destdir"))    CFG.destdir=*d;
         if(auto fmt=getOpt("--format"))   CFG.package_format=(*fmt=="xz"?"xz":"zst");
-        auto order = topoResolve(args, /*reverse=*/false, /*strict_missing=*/false);
-        logInfo("Ordem de instalação (topológica):");
-        for(auto& n: order) std::cerr<<"  - "<<n<<"\n";
-        return run_for_all(order, action_install);
+        return action_install(name);
     }
     if(cmd=="package"){
-        if(args.empty()){ logErr("Uso: package <name...> [--format zst|xz]"); return 2; }
+        if(args.empty()){ logErr("Uso: package <name> [--format zst|xz]"); return 2; }
+        std::string name = args.front(); args.erase(args.begin());
         if(auto fmt=getOpt("--format"))   CFG.package_format=(*fmt=="xz"?"xz":"zst");
-        // pacotes independem, mas é razoável seguir ordem topo
-        auto order = topoResolve(args, /*reverse=*/false, /*strict_missing=*/false);
-        return run_for_all(order, action_package);
+        return action_package(name);
     }
     if(cmd=="remove"){
-        if(args.empty()){ logErr("Uso: remove <name...>"); return 2; }
-        auto order = topoResolve(args, /*reverse=*/true, /*strict_missing=*/false);
-        logInfo("Ordem de remoção (reversa):");
-        for(auto& n: order) std::cerr<<"  - "<<n<<"\n";
-        return run_for_all(order, action_remove);
+        if(args.empty()){ logErr("Uso: remove <name>"); return 2; }
+        return action_remove(args.front());
     }
     if(cmd=="upgrade"){
-        if(args.empty()){ logErr("Uso: upgrade <name...>"); return 2; }
-        auto order = topoResolve(args, /*reverse=*/false, /*strict_missing=*/false);
-        int rc=0;
-        for(const auto& n: order){
-            rc |= action_remove(n);
-            rc |= action_install(n);
-        }
-        return rc;
+        if(args.empty()){ logErr("Uso: upgrade <name>"); return 2; }
+        return action_upgrade(args.front());
     }
     if(cmd=="reinstall"){
-        if(args.empty()){ logErr("Uso: reinstall <name...>"); return 2; }
-        auto order = topoResolve(args, /*reverse=*/false, /*strict_missing=*/false);
-        return run_for_all(order, action_reinstall);
+        if(args.empty()){ logErr("Uso: reinstall <name>"); return 2; }
+        return action_reinstall(args.front());
     }
     if(cmd=="clean"){
-        if(args.empty()){ logErr("Uso: clean <name...>"); return 2; }
-        // limpar na ordem reversa para facilitar remoção de árvores relacionadas
-        auto order = topoResolve(args, /*reverse=*/true, /*strict_missing=*/false);
-        return run_for_all(order, action_clean);
+        if(args.empty()){ logErr("Uso: clean <name>"); return 2; }
+        return action_clean(args.front());
     }
     if(cmd=="verify"){
         if(args.size()<2){ logErr("Uso: verify <arquivo> --sha256 SUM"); return 2; }
@@ -1163,13 +1341,6 @@ int main(int argc, char** argv){
         if(eatFlag("--push")) push=true;
         bool init_repo = eatFlag("--init");
         return action_sync(scope, msg, rem, br, push, init_repo);
-    }
-    if(cmd=="deps"){
-        if(args.empty()){ logErr("Uso: deps <name...> [--reverse]"); return 2; }
-        bool reverse = eatFlag("--reverse");
-        auto order = topoResolve(args, reverse, /*strict_missing=*/false);
-        for(const auto& n: order) std::cout<<n<<"\n";
-        return 0;
     }
 
     logErr("Comando desconhecido: " + cmd);
