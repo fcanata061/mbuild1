@@ -1,0 +1,192 @@
+===============================================================
+                 M B U I L D   —   Manual Completo
+===============================================================
+
+mbuild é uma ferramenta de build/empacote estilo LFS, capaz de:
+- Baixar fontes
+- Extrair e compilar
+- Rodar testes
+- Instalar com DESTDIR + fakeroot
+- Resolver dependências automaticamente
+- Empacotar e remover pacotes
+- Gerar logs e sincronizar com git
+
+---------------------------------------------------------------
+1. ÁRVORE DE DIRETÓRIOS
+---------------------------------------------------------------
+
+mbuild mantém a seguinte estrutura:
+
+  $HOME/.mbuild/
+    ├── sources/     # onde ficam os tarballs originais
+    ├── work/        # diretórios temporários de build
+    ├── logs/        # logs separados por pacote
+    ├── staging/     # área temporária de instalação (DESTDIR)
+    ├── packages/    # pacotes binários gerados (.tar.xz/.tar.zst)
+    ├── repo/        # repositório de receitas .meta
+    └── bin/         # scripts auxiliares (opcional)
+
+Cada pacote instalado também gera metadados em:
+  $HOME/.mbuild/repo/db.txt
+
+---------------------------------------------------------------
+2. COMANDOS SUPORTADOS
+---------------------------------------------------------------
+
+Uso:
+  mbuild <comando> [opções]
+
+Comandos principais:
+  help | h | 0         → Mostrar ajuda
+  fetch | f | 1        → Baixar fontes (curl/git/dir)
+  extract | x | 2      → Extrair tarball para work
+  build | b | 3        → Compilar [--jobs N]
+  test | t | 4         → Rodar testes
+  install | i | 5      → Instalar (resolve deps)
+                         Opções: --destdir D --fakeroot
+                                 --strip|--no-strip
+                                 --strip-flags F
+                                 --format zst|xz
+  package | p | 6      → Gerar pacote a partir do staging
+  remove | rm | 7      → Remover em ordem reversa
+  upgrade | up | 8     → Remover + instalar (com deps)
+  reinstall | ri | 9   → Reinstalar (com deps)
+  clean | c | 10       → Limpar work/logs/staging de um pacote
+  info | 11            → Mostrar metadados do pacote
+  search | s | 12      → Buscar no repositório local
+  verify | v | 13      → Verificar SHA256 de um arquivo
+  revdep | 14          → Checar dependências ausentes via ldd
+  sync | 15            → Sincronizar com git (repo, logs, etc.)
+
+---------------------------------------------------------------
+3. PARÂMETROS DE RECEITAS (.meta)
+---------------------------------------------------------------
+
+Cada pacote possui um arquivo `NOME.meta` no diretório `repo/`.
+
+Parâmetros suportados:
+  name=         → nome do pacote
+  version=      → versão
+  source=       → URL do tarball
+  sha256=       → checksum para validação
+  depends=      → lista de dependências
+  builddir=     → diretório separado de build
+  configure=    → linha de configuração
+  make=         → comando de build
+  test=         → comando de testes
+  install=      → comando de instalação
+  strip=        → se aplica strip (sim/não)
+  format=       → formato do pacote (xz ou zst)
+
+---------------------------------------------------------------
+4. COMO INSTALAR O MBUILD
+---------------------------------------------------------------
+
+1. Copie o código-fonte do `mbuild` para um diretório:
+   $ git clone <repo> mbuild
+
+2. Instale via Makefile:
+   $ sudo make install
+
+3. Isso instalará `mbuild` em `/usr/local/bin/mbuild`.
+
+---------------------------------------------------------------
+5. RECEITAS REAIS
+---------------------------------------------------------------
+
+Como aplicar patch 
+
+configure=patch -p1 < ../../repo/patches/glibc-sigfix.patch && ../configure --prefix=/usr --disable-werror
+---------------------------------------------------
+5.1 Receita do GCC (13.2.0)
+---------------------------------------------------
+[repo/gcc.meta]
+
+name=gcc
+version=13.2.0
+source=https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+sha256=ba1f0b6e34c89f9aa89baf41c6c8f6c2a6b3c14c6b08dffb8051e8cf70b51fef
+depends=gmp,mpfr,mpc,isl,binutils
+builddir=build
+configure=../configure --prefix=/usr \
+    --disable-multilib \
+    --enable-languages=c,c++ \
+    --enable-default-pie \
+    --enable-default-ssp
+make=make
+test=make -k check
+install=make install
+
+---------------------------------------------------
+5.2 Receita da GLIBC (2.39)
+---------------------------------------------------
+[repo/glibc.meta]
+
+name=glibc
+version=2.39
+source=https://ftp.gnu.org/gnu/libc/glibc-2.39.tar.xz
+sha256=5bb253e548f422a8cf67c8a70a15750cdd2a39f41a3c5a0e4e2e4c3f4fdf0cf7
+depends=linux-headers
+builddir=build
+configure=../configure --prefix=/usr \
+    --disable-werror
+make=make
+test=make check
+install=make install
+
+---------------------------------------------------
+5.3 Receita do FIREFOX (118.0)
+---------------------------------------------------
+[repo/firefox.meta]
+
+name=firefox
+version=118.0
+source=https://ftp.mozilla.org/pub/firefox/releases/118.0/source/firefox-118.0.source.tar.xz
+sha256=98a72c42a21e34deba3ab69b2c7a2a8d61b3cc0b33d0797d17edc70da8f64e9e
+depends=gtk3,rust,cbindgen,python3,clang,llvm,libx11,libxcb,dbus,alsa-lib
+builddir=build
+configure=../mach configure --prefix=/usr
+make=../mach build
+test=../mach test
+install=../mach install
+
+---------------------------------------------------------------
+6. MAKEFILE DE INSTALAÇÃO
+---------------------------------------------------------------
+
+[Makefile]
+
+PREFIX ?= /usr/local
+
+all:
+	@echo "Use 'make install' para instalar o mbuild"
+
+install:
+	mkdir -p $(DESTDIR)$(PREFIX)/bin
+	cp mbuild $(DESTDIR)$(PREFIX)/bin/mbuild
+	chmod +x $(DESTDIR)$(PREFIX)/bin/mbuild
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/mbuild
+
+---------------------------------------------------------------
+7. EXEMPLOS DE USO
+---------------------------------------------------------------
+
+# Baixar e preparar GCC
+mbuild fetch gcc
+mbuild extract gcc
+mbuild build gcc --jobs 8
+mbuild test gcc
+mbuild install gcc --fakeroot --destdir=/tmp/pkgroot
+mbuild package gcc --format zst
+
+# Consultar informações
+mbuild info gcc
+mbuild search gcc
+
+# Remover pacotes em ordem reversa
+mbuild remove gcc
+
+# Sincronizar repositório de receitas com git
+mbuild sync repo --message "update gcc"
